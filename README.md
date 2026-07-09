@@ -1,5 +1,7 @@
 # ghostty-rectangle-tile-helper
 
+## Overview
+
 Tile open [Ghostty](https://ghostty.org) windows on macOS into a fixed grid, then bring Ghostty to the foreground.
 
 Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency and no other third-party packages.
@@ -12,22 +14,27 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 | 4 | 2×2 quarters | all |
 | 5+ | 2×3 sixths | first 6 |
 
-## Requirements
+**Requirements**
 
 - macOS with **Ghostty** installed
 - **Accessibility** permission for the host that runs the script ([Raycast](https://www.raycast.com), Terminal, Shortcuts, etc.)
 
-## Install
+## Quickstart
 
 ```sh
 git clone https://github.com/mattmcgiv/ghostty-rectangle-tile-helper.git
 cd ghostty-rectangle-tile-helper
 chmod +x bin/tile-ghostty raycast/tile-ghostty.sh
+./bin/tile-ghostty
 ```
 
-## Raycast
+Open one or more Ghostty windows, put the mouse on the target display, then run the command again. Ghostty must grant **Accessibility** to the host (Terminal, Raycast, etc.) on first run.
 
-Use a [Script Command](https://github.com/raycast/script-commands):
+For keyboard-driven use day to day, set up Raycast below.
+
+## Raycast Setup
+
+Use a [Script Command](https://github.com/raycast/script-commands) so you can tile from Raycast search or a hotkey (no Spotlight).
 
 1. Open **Raycast Settings → Extensions → Script Commands**.
 2. **Add Directories** and select this repo’s `raycast/` folder (the directory that contains `tile-ghostty.sh`).
@@ -40,17 +47,11 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 
 `raycast/tile-ghostty.sh` is a thin wrapper around `bin/tile-ghostty` (`@raycast.mode silent` so Raycast does not keep a panel open).
 
-## CLI
-
-```sh
-./bin/tile-ghostty
-```
-
 ## How it works
 
 1. Finds the Ghostty process and its Accessibility (AX) windows.
 2. Reads the **visible frame** of the display under the mouse (excludes menu bar / dock).
-3. Chooses a grid by window count (see table above).
+3. Chooses a grid by window count (see table in Overview).
 4. Sets each window’s `AXPosition` / `AXSize`.
 5. Raises tiled windows and activates Ghostty (plus a short delayed re-activate so the launcher does not keep focus).
 
@@ -74,6 +75,10 @@ exec "$TILER"
 - **Wrong display:** Put the mouse on the target display, then run the command.
 - **Partial layout:** Increase `TILE_GHOSTTY_SETTLE`; check stderr for `fails:`.
 - **Ghostty not frontmost:** Ensure Accessibility is granted; the script raises windows and runs a delayed `activate`.
+
+## Contributing
+
+Pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
