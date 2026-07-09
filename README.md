@@ -6,8 +6,9 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 
 | Open Ghostty windows | Layout | Max tiled |
 |---|---|---|
-| 1–2 | 2×2 quarters (fill first cells) | all |
-| **3** | **1×3 thirds** (full height) | all |
+| 1 | 1×1 full visible frame | all |
+| 2 | 1×2 halves (full height) | all |
+| 3 | 1×3 thirds (full height) | all |
 | 4 | 2×2 quarters | all |
 | 5+ | 2×3 sixths | first 6 |
 
