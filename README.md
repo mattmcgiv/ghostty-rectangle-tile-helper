@@ -12,7 +12,10 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 | 2 | 1×2 halves (full height) | all |
 | 3 | 1×3 thirds (full height) | all |
 | 4 | 2×2 quarters | all |
-| 5+ | 2×3 sixths | first 6 |
+| 5–6 | 2×3 sixths | all |
+| 7–8 | 2×4 eighths | all |
+| 9–12 | 3×4 twelfths | all |
+| 13+ | 3×4 twelfths | first 12 |
 
 **Requirements**
 

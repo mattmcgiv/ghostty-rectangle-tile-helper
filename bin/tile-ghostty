@@ -1,11 +1,13 @@
 #!/usr/bin/swift
 // tile-ghostty — Tile open Ghostty windows into a grid.
 //
-// 1 window   → 1×1 full visible frame
-// 2 windows  → 1×2 halves (L, R)
-// 3 windows  → 1×3 thirds (L, C, R)
-// 4 windows  → 2×2 quarters (row-major: TL, TR, BL, BR)
-// ≥5 windows → 2×3 sixths (max 6; row-major)
+// 1 window    → 1×1 full visible frame
+// 2 windows   → 1×2 halves (L, R)
+// 3 windows   → 1×3 thirds (L, C, R)
+// 4 windows   → 2×2 quarters (row-major)
+// 5–6 windows → 2×3 sixths (row-major)
+// 7–8 windows → 2×4 eighths (row-major)
+// 9–12 windows → 3×4 twelfths (max 12; row-major)
 //
 // Uses macOS Accessibility + AppKit only (no Rectangle). Direct AX frame
 // sets avoid the frontmost-window races that stacked tiles in the top-left
@@ -272,11 +274,13 @@ guard let primary = NSScreen.screens.first else {
 let frame = axVisibleFrame(of: screen, primary: primary)
 
 // Layout by window count:
-//   1  → 1×1 (full visible frame)
-//   2  → 1×2 (full-height halves)
-//   3  → 1×3 (full-height thirds)
-//   4  → 2×2 quarters
-//   5+ → 2×3 sixths (cap 6)
+//   1     → 1×1 (full visible frame)
+//   2     → 1×2 (full-height halves)
+//   3     → 1×3 (full-height thirds)
+//   4     → 2×2 quarters
+//   5–6   → 2×3 sixths
+//   7–8   → 2×4 eighths
+//   9–12+ → 3×4 twelfths (cap 12)
 let cols: Int
 let rows: Int
 switch windows.count {
@@ -292,9 +296,16 @@ case 3:
 case 4:
     cols = 2
     rows = 2
-default:
+case 5, 6:
     cols = 3
     rows = 2
+case 7, 8:
+    cols = 4
+    rows = 2
+default:
+    // 9+ windows → 3×4 (cap at 12 via tileCount)
+    cols = 4
+    rows = 3
 }
 
 let tileCount = min(windows.count, cols * rows)

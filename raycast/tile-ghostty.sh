@@ -8,7 +8,7 @@
 
 # Optional parameters:
 # @raycast.icon 🖥️
-# @raycast.description Tile open Ghostty windows (2×2 / 1×3 / 2×3) and bring Ghostty to the front
+# @raycast.description Tile open Ghostty windows (1×1–3×4 grids up to 12) and bring Ghostty to the front
 
 set -euo pipefail
 

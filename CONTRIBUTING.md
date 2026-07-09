@@ -14,7 +14,7 @@ Thanks for your interest in improving this project. **Pull requests are welcome.
 1. Fork the repo and create a branch from `main`.
 2. Keep changes focused: one idea per PR when you can.
 3. Update `README.md` if behavior or setup steps change.
-4. Test on macOS with real Ghostty windows (1 through 6+ if layout logic is involved).
+4. Test on macOS with real Ghostty windows (1 through 12+ if layout logic is involved).
 5. Do not commit secrets, personal absolute paths, or machine-specific config.
 
 ## Development notes
