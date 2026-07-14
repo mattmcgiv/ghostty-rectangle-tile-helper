@@ -1,5 +1,8 @@
 #!/usr/bin/swift
-// tile-ghostty — Tile open Ghostty windows into a grid.
+// tile-ghostty — Tile open Ghostty (+ ChatGPT) windows into a grid.
+//
+// Collects standard windows from Ghostty and the ChatGPT macOS app, then
+// tiles them together with the same grid rules as before:
 //
 // 1 window    → 1×1 full visible frame
 // 2 windows   → 1×2 halves (L, R)
@@ -8,6 +11,8 @@
 // 5–6 windows → 2×3 sixths (row-major)
 // 7–8 windows → 2×4 eighths (row-major)
 // 9–12 windows → 3×4 twelfths (max 12; row-major)
+//
+// Window order: Ghostty first (AX order), then ChatGPT (AX order).
 //
 // Uses macOS Accessibility + AppKit only (no Rectangle). Direct AX frame
 // sets avoid the frontmost-window races that stacked tiles in the top-left
@@ -19,6 +24,72 @@
 import AppKit
 import ApplicationServices
 import Foundation
+
+// MARK: - Target apps
+
+/// An app whose standard windows participate in the shared tile grid.
+struct TileTarget {
+    /// Exact lowercased process / localized names to match.
+    let names: Set<String>
+    /// Bundle identifiers (exact, lowercased) or substrings that uniquely identify the app.
+    let bundleMatchers: [String]
+    /// Name used with `tell application "…" to activate`.
+    let activateName: String
+    /// Sort key so Ghostty stays before ChatGPT when concatenating windows.
+    let order: Int
+}
+
+let tileTargets: [TileTarget] = [
+    TileTarget(
+        names: ["ghostty"],
+        bundleMatchers: ["com.mitchellh.ghostty", "ghostty"],
+        activateName: "Ghostty",
+        order: 0
+    ),
+    TileTarget(
+        names: ["chatgpt"],
+        // Official ChatGPT macOS app ships as com.openai.codex.
+        bundleMatchers: ["com.openai.codex", "chatgpt"],
+        activateName: "ChatGPT",
+        order: 1
+    ),
+]
+
+func targetMatching(name: String?, bundle: String?) -> TileTarget? {
+    let n = (name ?? "").lowercased()
+    let b = (bundle ?? "").lowercased()
+    for t in tileTargets {
+        if t.names.contains(n) {
+            return t
+        }
+        for m in t.bundleMatchers {
+            if m.contains(".") {
+                if b == m { return t }
+            } else if !b.isEmpty && b.contains(m) {
+                return t
+            }
+        }
+    }
+    return nil
+}
+
+/// Skip Dock extras, XPC helpers, and other non-main processes.
+func isMainGUIApp(_ app: NSRunningApplication) -> Bool {
+    guard let bid = app.bundleIdentifier?.lowercased() else {
+        // No bundle id: allow only if localized name is an exact target name.
+        let n = (app.localizedName ?? "").lowercased()
+        return tileTargets.contains { $0.names.contains(n) }
+    }
+    if bid.contains("dock.external") || bid.contains(".xpc") || bid.contains("helper") {
+        return false
+    }
+    if bid.hasPrefix("com.apple.") && !tileTargets.contains(where: { t in
+        t.bundleMatchers.contains { bid == $0 }
+    }) {
+        return false
+    }
+    return true
+}
 
 // MARK: - Helpers
 
@@ -61,27 +132,37 @@ func targetScreen() -> NSScreen {
     return NSScreen.main ?? primary
 }
 
-func ghosttyPID() -> pid_t? {
+/// Resolve running PIDs for every configured tile target (deduped).
+func targetPIDs() -> [(pid: pid_t, target: TileTarget)] {
+    var found: [pid_t: TileTarget] = [:]
+
     let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-        return nil
-    }
-    for w in info {
-        let owner = (w[kCGWindowOwnerName as String] as? String ?? "").lowercased()
-        if owner == "ghostty" {
-            return w[kCGWindowOwnerPID as String] as? pid_t
+    if let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+        for w in info {
+            let owner = w[kCGWindowOwnerName as String] as? String
+            guard let t = targetMatching(name: owner, bundle: nil) else { continue }
+            if let pid = w[kCGWindowOwnerPID as String] as? pid_t {
+                found[pid] = t
+            }
         }
     }
-    // Fallback: runningApplications
+
     for app in NSWorkspace.shared.runningApplications {
-        if let name = app.localizedName?.lowercased(), name == "ghostty" {
-            return app.processIdentifier
+        guard isMainGUIApp(app) else { continue }
+        guard let t = targetMatching(name: app.localizedName, bundle: app.bundleIdentifier) else {
+            continue
         }
-        if let bundle = app.bundleIdentifier?.lowercased(), bundle.contains("ghostty") {
-            return app.processIdentifier
-        }
+        found[app.processIdentifier] = t
     }
-    return nil
+
+    return found
+        .map { (pid: $0.key, target: $0.value) }
+        .sorted { a, b in
+            if a.target.order != b.target.order {
+                return a.target.order < b.target.order
+            }
+            return a.pid < b.pid
+        }
 }
 
 func axValuePoint(_ point: CGPoint) -> AXValue {
@@ -120,50 +201,177 @@ func copyBool(_ element: AXUIElement, _ attr: String) -> Bool? {
     return (ref as? Bool)
 }
 
+/// A window participating in the shared tile grid, tagged with owning app.
+struct TiledWindow {
+    let element: AXUIElement
+    let pid: pid_t
+    let activateName: String
+}
+
+/// Raise in z-order only — do not steal key/main (that demotes sibling windows).
 func raiseWindow(_ element: AXUIElement) {
     AXUIElementPerformAction(element, kAXRaiseAction as CFString)
-    // Mark as main when the attribute exists (helps key-window selection).
+}
+
+func focusWindow(_ element: AXUIElement) {
+    raiseWindow(element)
     AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
 }
 
-func activateGhosttyApp(_ app: NSRunningApplication) {
-    // activateIgnoringOtherApps is a no-op on macOS 14+; activateAllWindows still
-    // helps surface the full window set. Pair with AppleScript activate for force.
-    app.activate(options: [.activateAllWindows])
+func setAppFrontmost(pid: pid_t) {
+    let appEl = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+}
+
+func activateApp(named name: String, running: NSRunningApplication?) {
+    if let running {
+        if running.isHidden {
+            running.unhide()
+        }
+        // activateAllWindows surfaces every window of the app, not only the key one.
+        // Prefer AppKit over a second osascript activate — double-activate caused
+        // extra menu-bar / focus flicker without improving stack order.
+        running.activate(options: [.activateAllWindows])
+        setAppFrontmost(pid: running.processIdentifier)
+        return
+    }
+    // Fallback when we only have a name (no live process handle).
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    proc.arguments = ["-e", "tell application \"Ghostty\" to activate"]
+    proc.arguments = ["-e", "tell application \"\(name)\" to activate"]
     proc.standardOutput = FileHandle.nullDevice
     proc.standardError = FileHandle.nullDevice
     try? proc.run()
     proc.waitUntilExit()
 }
 
-func bringGhosttyForward(pid: pid_t, windows: [AXUIElement]) {
-    // Raise every tiled window, then key the first so Ghostty is clearly frontmost.
-    for win in windows {
-        raiseWindow(win)
-    }
-    if let first = windows.first {
-        raiseWindow(first)
+/// Bring every tiled window above unrelated apps.
+///
+/// macOS has one key app. Activating an app with `activateAllWindows` lifts that
+/// app’s whole window group above the previous frontmost app. We therefore
+/// activate **once per target app** (not once per window), raise all of that
+/// app’s tiles while it is frontmost, and finish on Ghostty when present so
+/// mixed Ghostty + ChatGPT sets stay above non-target apps without focus thrash.
+func bringTargetsForward(_ windows: [TiledWindow]) {
+    guard !windows.isEmpty else { return }
+
+    var appOrder: [(pid: pid_t, name: String)] = []
+    var byPid: [pid_t: [AXUIElement]] = [:]
+    for w in windows {
+        if byPid[w.pid] == nil {
+            appOrder.append((w.pid, w.activateName))
+            byPid[w.pid] = []
+        }
+        byPid[w.pid, default: []].append(w.element)
     }
 
-    if let app = NSRunningApplication(processIdentifier: pid) {
-        activateGhosttyApp(app)
+    func unminimizeAndRaise(_ el: AXUIElement) {
+        if copyBool(el, kAXMinimizedAttribute as String) == true {
+            AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        if copyBool(el, "AXFullScreen") == true {
+            AXUIElementSetAttributeValue(el, "AXFullScreen" as CFString, kCFBooleanFalse)
+        }
+        raiseWindow(el)
     }
 
-    // Second pass after activate — hosts like Shortcuts can race for focus.
-    Thread.sleep(forTimeInterval: 0.05)
-    for win in windows {
-        raiseWindow(win)
+    // Non-key apps first, Ghostty last (appOrder is Ghostty → ChatGPT by target.order).
+    // Activating ChatGPT first lifts it above whatever was frontmost; activating
+    // Ghostty last leaves Ghostty key while both groups stay above non-targets.
+    for app in appOrder.reversed() {
+        let running = NSRunningApplication(processIdentifier: app.pid)
+        activateApp(named: app.name, running: running)
+        // Brief settle so AXRaise applies against the new frontmost app.
+        Thread.sleep(forTimeInterval: 0.03)
+        for el in byPid[app.pid] ?? [] {
+            unminimizeAndRaise(el)
+        }
     }
-    if let first = windows.first {
-        raiseWindow(first)
+
+    // Pure z-order pass — no further activates (avoids per-window focus flicker).
+    for w in windows {
+        raiseWindow(w.element)
     }
-    if let app = NSRunningApplication(processIdentifier: pid) {
-        activateGhosttyApp(app)
+}
+
+/// Detached AppleScript written to a temp file (multi-line `-e` is fragile).
+/// After Raycast/Terminal reclaim focus, activate each target app once and AXRaise.
+func scheduleDeferredRaise(appNames: [String]) {
+    guard !appNames.isEmpty else { return }
+
+    // Prefer finishing on Ghostty when it contributed (matches pre-ChatGPT behavior).
+    let orderedNames: [String] = {
+        if appNames.contains("Ghostty") {
+            return appNames.filter { $0 != "Ghostty" } + ["Ghostty"]
+        }
+        return appNames
+    }()
+
+    // One cycle only: activate each app once → frontmost → raise its windows.
+    // (Previously two full cycles; the second was pure focus flicker.)
+    var lines: [String] = [
+        "delay 0.25",
+    ]
+    for name in orderedNames {
+        let escaped = name
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        lines.append(contentsOf: [
+            "try",
+            "  tell application \"\(escaped)\" to activate",
+            "end try",
+            "delay 0.04",
+            "tell application \"System Events\"",
+            "  if exists process \"\(escaped)\" then",
+            "    tell process \"\(escaped)\"",
+            "      set visible to true",
+            "      set frontmost to true",
+            "      repeat with w in (every window)",
+            "        try",
+            "          set value of attribute \"AXMinimized\" of w to false",
+            "          perform action \"AXRaise\" of w",
+            "        end try",
+            "      end repeat",
+            "    end tell",
+            "  end if",
+            "end tell",
+            "delay 0.04",
+        ])
     }
+
+    let script = lines.joined(separator: "\n")
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("tile-ghostty-reraise-\(ProcessInfo.processInfo.processIdentifier).scpt.txt")
+    do {
+        try script.write(to: tmp, atomically: true, encoding: .utf8)
+    } catch {
+        // Fall back to a minimal multi-activate if we cannot write the script.
+        let reActivate = Process()
+        reActivate.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        var args: [String] = ["-e", "delay 0.25"]
+        for name in orderedNames {
+            args.append(contentsOf: ["-e", "tell application \"\(name)\" to activate"])
+            args.append(contentsOf: ["-e", "delay 0.05"])
+        }
+        reActivate.arguments = args
+        reActivate.standardOutput = FileHandle.nullDevice
+        reActivate.standardError = FileHandle.nullDevice
+        try? reActivate.run()
+        return
+    }
+
+    // Run: osascript file; then rm file (best-effort, in same shell).
+    let reActivate = Process()
+    reActivate.executableURL = URL(fileURLWithPath: "/bin/bash")
+    let path = tmp.path.replacingOccurrences(of: "'", with: "'\\''")
+    reActivate.arguments = [
+        "-c",
+        "/usr/bin/osascript '\(path)' >/dev/null 2>&1; rm -f '\(path)'",
+    ]
+    reActivate.standardOutput = FileHandle.nullDevice
+    reActivate.standardError = FileHandle.nullDevice
+    try? reActivate.run()
 }
 
 func setFrame(_ element: AXUIElement, origin: CGPoint, size: CGSize) -> Bool {
@@ -195,11 +403,18 @@ func setFrame(_ element: AXUIElement, origin: CGPoint, size: CGSize) -> Bool {
         }
 
         // Verify roughly on-target (tolerance for window chrome rounding).
+        // Some apps (e.g. ChatGPT) clamp size to a minimum; position still counts
+        // as a successful tile when the frame origin landed.
         let pos = copyPoint(element, kAXPositionAttribute as String) ?? .zero
         let sz = copySize(element, kAXSizeAttribute as String) ?? .zero
         let posOK = abs(pos.x - origin.x) < 40 && abs(pos.y - origin.y) < 40
         let sizeOK = abs(sz.width - size.width) < 80 && abs(sz.height - size.height) < 80
-        if posOK && sizeOK {
+        let sizeClampedOK = posOK
+            && sz.width >= 50 && sz.height >= 50
+            && abs(sz.width - size.width) < 250
+            && abs(sz.height - size.height) < 250
+        if posOK && (sizeOK || sizeClampedOK) {
+            // Raise only — focusing every window during placement buries siblings.
             raiseWindow(element)
             return true
         }
@@ -251,18 +466,34 @@ if !axTrusted() {
     die("Accessibility permission required. Enable this host (Shortcuts/Terminal) in System Settings → Privacy & Security → Accessibility, then re-run.")
 }
 
-guard let pid = ghosttyPID() else {
+let apps = targetPIDs()
+if apps.isEmpty {
     // Nothing to do.
     exit(0)
 }
 
-// Activate Ghostty so windows are on-screen / AX-ready.
-if let app = NSRunningApplication(processIdentifier: pid) {
-    activateGhosttyApp(app)
-    Thread.sleep(forTimeInterval: 0.05)
+// Activate target apps so windows are on-screen / AX-ready.
+var activated = Set<String>()
+for e in apps {
+    if activated.insert(e.target.activateName).inserted {
+        let app = NSRunningApplication(processIdentifier: e.pid)
+        activateApp(named: e.target.activateName, running: app)
+    }
+}
+Thread.sleep(forTimeInterval: 0.05)
+
+// Ghostty windows first, then ChatGPT — each app in AX order.
+var windows: [TiledWindow] = []
+for e in apps {
+    for el in standardWindows(pid: e.pid) {
+        windows.append(TiledWindow(
+            element: el,
+            pid: e.pid,
+            activateName: e.target.activateName
+        ))
+    }
 }
 
-let windows = standardWindows(pid: pid)
 if windows.isEmpty {
     exit(0)
 }
@@ -328,7 +559,7 @@ for i in 0..<tileCount {
     let origin = CGPoint(x: x.rounded(), y: y.rounded())
     let size = CGSize(width: w.rounded(), height: h.rounded())
 
-    if setFrame(tiledWindows[i], origin: origin, size: size) {
+    if setFrame(tiledWindows[i].element, origin: origin, size: size) {
         ok += 1
     } else {
         fail += 1
@@ -345,21 +576,18 @@ if fail > 0 {
     fputs("tile-ghostty: partial success — tiled:\(ok)/\(tileCount) grid:\(cols)x\(rows) fails:\(fail)\n", stderr)
 }
 
-// Requirement: leave Ghostty (and its tiled windows) in the foreground.
-// Especially important when invoked from Shortcuts, which otherwise keeps focus.
-bringGhosttyForward(pid: pid, windows: tiledWindows)
+// Raise every tiled window above non-target apps (multi-app aware).
+bringTargetsForward(tiledWindows)
 
-// Detached re-activate after this process exits. Shortcuts (and some shells)
-// reclaim focus when the Run Shell Script action finishes; a short delayed
-// `osascript` wins that race without blocking the shortcut.
-let reActivate = Process()
-reActivate.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-reActivate.arguments = [
-    "-e", "delay 0.2",
-    "-e", "tell application \"Ghostty\" to activate",
-]
-reActivate.standardOutput = FileHandle.nullDevice
-reActivate.standardError = FileHandle.nullDevice
-try? reActivate.run()
+// Detached re-raise after this process exits. Raycast/Terminal/Shortcuts often
+// reclaim focus when the script ends; cycle Ghostty + ChatGPT and AXRaise.
+var appNames: [String] = []
+var seenNames = Set<String>()
+for w in tiledWindows {
+    if seenNames.insert(w.activateName).inserted {
+        appNames.append(w.activateName)
+    }
+}
+scheduleDeferredRaise(appNames: appNames)
 
 exit(0)

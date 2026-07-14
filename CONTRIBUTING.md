@@ -14,7 +14,7 @@ Thanks for your interest in improving this project. **Pull requests are welcome.
 1. Fork the repo and create a branch from `main`.
 2. Keep changes focused: one idea per PR when you can.
 3. Update `README.md` if behavior or setup steps change.
-4. Test on macOS with real Ghostty windows (1 through 12+ if layout logic is involved).
+4. Test on macOS with real Ghostty and/or ChatGPT windows (1 through 12+ if layout logic is involved).
 5. Do not commit secrets, personal absolute paths, or machine-specific config.
 
 ## Development notes
@@ -31,12 +31,12 @@ chmod +x bin/tile-ghostty raycast/tile-ghostty.sh
 ./bin/tile-ghostty
 ```
 
-Confirm windows move as expected and Ghostty ends up frontmost when launched from Terminal and from Raycast.
+Confirm windows move as expected (including mixed Ghostty + ChatGPT sets) when launched from Terminal and from Raycast.
 
 ## Pull request checklist
 
 - [ ] Clear description of the problem and the change
-- [ ] Tested with Ghostty on macOS
+- [ ] Tested with Ghostty and ChatGPT on macOS
 - [ ] README (and comments) updated if user-facing behavior changed
 - [ ] No sensitive or machine-specific data
 

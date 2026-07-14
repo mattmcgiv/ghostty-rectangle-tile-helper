@@ -2,11 +2,11 @@
 
 ## Overview
 
-Tile open [Ghostty](https://ghostty.org) windows on macOS into a fixed grid, then bring Ghostty to the foreground.
+Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on macOS into a shared fixed grid, then raise those windows and activate the apps.
 
 Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency and no other third-party packages.
 
-| Open Ghostty windows | Layout | Max tiled |
+| Open windows (Ghostty + ChatGPT) | Layout | Max tiled |
 |---|---|---|
 | 1 | 1×1 full visible frame | all |
 | 2 | 1×2 halves (full height) | all |
@@ -17,9 +17,11 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 | 9–12 | 3×4 twelfths | all |
 | 13+ | 3×4 twelfths | first 12 |
 
+**Window order:** Ghostty windows first (Accessibility order), then ChatGPT windows.
+
 **Requirements**
 
-- macOS with **Ghostty** installed
+- macOS with **Ghostty** and/or the **ChatGPT** desktop app installed
 - **Accessibility** permission for the host that runs the script ([Raycast](https://www.raycast.com), Terminal, Shortcuts, etc.)
 
 ## Quickstart
@@ -31,7 +33,7 @@ chmod +x bin/tile-ghostty raycast/tile-ghostty.sh
 ./bin/tile-ghostty
 ```
 
-Open one or more Ghostty windows, put the mouse on the target display, then run the command again. Ghostty must grant **Accessibility** to the host (Terminal, Raycast, etc.) on first run.
+Open one or more Ghostty and/or ChatGPT windows, put the mouse on the target display, then run the command again. The host process must grant **Accessibility** (Terminal, Raycast, etc.) on first run.
 
 For keyboard-driven use day to day, set up Raycast below.
 
@@ -52,11 +54,11 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 
 ## How it works
 
-1. Finds the Ghostty process and its Accessibility (AX) windows.
+1. Finds running **Ghostty** and **ChatGPT** processes and their Accessibility (AX) windows.
 2. Reads the **visible frame** of the display under the mouse (excludes menu bar / dock).
-3. Chooses a grid by window count (see table in Overview).
+3. Chooses a grid by combined window count (see table in Overview).
 4. Sets each window’s `AXPosition` / `AXSize`.
-5. Raises tiled windows and activates Ghostty (plus a short delayed re-activate so the launcher does not keep focus).
+5. Raises tiled windows without focus thrash: each target app is activated **once** with all windows, then that app’s tiles are `AXRaise`d while it is frontmost (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot re-raise runs after exit so Raycast/Terminal does not keep focus.
 
 ## Configuration
 
@@ -77,7 +79,8 @@ exec "$TILER"
 - **Raycast does not list the command:** Confirm the `raycast/` directory is added under Script Commands → Directories, and `tile-ghostty.sh` is executable.
 - **Wrong display:** Put the mouse on the target display, then run the command.
 - **Partial layout:** Increase `TILE_GHOSTTY_SETTLE`; check stderr for `fails:`.
-- **Ghostty not frontmost:** Ensure Accessibility is granted; the script raises windows and runs a delayed `activate`.
+- **Apps not frontmost / some tiles buried:** Ensure Accessibility is granted for the host. The script activates each target app once and raises its tiles; only one app can be key (Ghostty when present), but both should sit above other apps. Re-run after dismissing ChatGPT floating dialogs (e.g. Computer Use) if they cover tiles.
+- **ChatGPT ignored:** Confirm the desktop app process is named **ChatGPT** (bundle `com.openai.codex`). Only standard windows are tiled.
 
 ## Contributing
 
