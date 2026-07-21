@@ -1,13 +1,13 @@
 #!/usr/bin/swift
 // tile-ghostty — Tile open Ghostty (+ ChatGPT) windows into a grid.
 //
-// Collects standard windows from Ghostty and the ChatGPT macOS app, then
-// tiles them together with the same grid rules as before:
+// Collects standard windows from Ghostty and the ChatGPT macOS app on the
+// selected display, then tiles them together with the same grid rules as before:
 //
 // 1 window    → 1×1 full visible frame
 // 2 windows   → 1×2 halves (L, R)
 // 3 windows   → 1×3 thirds (L, C, R)
-// 4 windows   → 2×2 quarters (row-major)
+// 4 windows   → 1×4 fourths (L → R)
 // 5–6 windows → 2×3 sixths (row-major)
 // 7–8 windows → 2×4 eighths (row-major)
 // 9–12 windows → 3×4 twelfths (max 12; row-major)
@@ -120,16 +120,67 @@ func axVisibleFrame(of screen: NSScreen, primary: NSScreen) -> CGRect {
     return CGRect(x: v.origin.x, y: axY, width: v.size.width, height: v.size.height)
 }
 
+func intersectionArea(_ a: CGRect, _ b: CGRect) -> CGFloat {
+    let intersection = a.intersection(b)
+    guard !intersection.isNull else { return 0 }
+    return intersection.width * intersection.height
+}
+
+func screenContainingMost(of window: CGRect, primary: NSScreen) -> NSScreen? {
+    NSScreen.screens.max {
+        intersectionArea(window, axFrame(of: $0, primary: primary))
+            < intersectionArea(window, axFrame(of: $1, primary: primary))
+    }
+}
+
 func targetScreen() -> NSScreen {
     let screens = NSScreen.screens
     guard let primary = screens.first else {
         die("no screens available")
     }
+
+    // A direct CLI invocation can retain a focused Ghostty/ChatGPT window.
+    // Raycast commonly becomes frontmost itself, so its reliable selector is
+    // the mouse location handled immediately below.
+    if let frontmost = NSWorkspace.shared.frontmostApplication,
+       targetMatching(name: frontmost.localizedName, bundle: frontmost.bundleIdentifier) != nil {
+        let app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        var focusedRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            app,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedRef
+        ) == .success,
+           let focused = focusedRef,
+           CFGetTypeID(focused) == AXUIElementGetTypeID() {
+            let element = unsafeBitCast(focused, to: AXUIElement.self)
+            if let origin = copyPoint(element, kAXPositionAttribute as String),
+               let size = copySize(element, kAXSizeAttribute as String),
+               let focusedScreen = screenContainingMost(
+                   of: CGRect(origin: origin, size: size),
+                   primary: primary
+               ) {
+                return focusedScreen
+            }
+        }
+    }
+
     let mouse = NSEvent.mouseLocation
     for s in screens where s.frame.contains(mouse) {
         return s
     }
     return NSScreen.main ?? primary
+}
+
+func axFrame(of screen: NSScreen, primary: NSScreen) -> CGRect {
+    let f = screen.frame
+    let primaryTop = primary.frame.maxY
+    return CGRect(
+        x: f.minX,
+        y: primaryTop - f.maxY,
+        width: f.width,
+        height: f.height
+    )
 }
 
 /// Resolve running PIDs for every configured tile target (deduped).
@@ -206,6 +257,28 @@ struct TiledWindow {
     let element: AXUIElement
     let pid: pid_t
     let activateName: String
+}
+
+func windowFrame(_ element: AXUIElement) -> CGRect? {
+    guard let origin = copyPoint(element, kAXPositionAttribute as String),
+          let size = copySize(element, kAXSizeAttribute as String),
+          size.width >= 50, size.height >= 50 else {
+        return nil
+    }
+    return CGRect(origin: origin, size: size)
+}
+
+/// Assign a spanning window to the display containing the largest part of it.
+func windowIsOnScreen(_ element: AXUIElement, screen: NSScreen, primary: NSScreen) -> Bool {
+    guard let window = windowFrame(element) else { return false }
+    let selectedFrame = axFrame(of: screen, primary: primary)
+    let selectedArea = intersectionArea(window, selectedFrame)
+    guard selectedArea > 0 else { return false }
+
+    let largestArea = NSScreen.screens
+        .map { intersectionArea(window, axFrame(of: $0, primary: primary)) }
+        .max() ?? 0
+    return selectedArea == largestArea
 }
 
 /// Raise in z-order only — do not steal key/main (that demotes sibling windows).
@@ -297,7 +370,7 @@ func bringTargetsForward(_ windows: [TiledWindow]) {
 
 /// Detached AppleScript written to a temp file (multi-line `-e` is fragile).
 /// After Raycast/Terminal reclaim focus, activate each target app once and AXRaise.
-func scheduleDeferredRaise(appNames: [String]) {
+func scheduleDeferredRaise(appNames: [String], frame: CGRect) {
     guard !appNames.isEmpty else { return }
 
     // Prefer finishing on Ghostty when it contributed (matches pre-ChatGPT behavior).
@@ -329,8 +402,14 @@ func scheduleDeferredRaise(appNames: [String]) {
             "      set frontmost to true",
             "      repeat with w in (every window)",
             "        try",
-            "          set value of attribute \"AXMinimized\" of w to false",
-            "          perform action \"AXRaise\" of w",
+            "          set windowPosition to position of w",
+            "          set windowSize to size of w",
+            "          set centerX to (item 1 of windowPosition) + ((item 1 of windowSize) / 2)",
+            "          set centerY to (item 2 of windowPosition) + ((item 2 of windowSize) / 2)",
+            "          if centerX >= \(Int(frame.minX)) and centerX < \(Int(frame.maxX)) and centerY >= \(Int(frame.minY)) and centerY < \(Int(frame.maxY)) then",
+            "            set value of attribute \"AXMinimized\" of w to false",
+            "            perform action \"AXRaise\" of w",
+            "          end if",
             "        end try",
             "      end repeat",
             "    end tell",
@@ -374,7 +453,13 @@ func scheduleDeferredRaise(appNames: [String]) {
     try? reActivate.run()
 }
 
-func setFrame(_ element: AXUIElement, origin: CGPoint, size: CGSize) -> Bool {
+func setFrame(
+    _ element: AXUIElement,
+    origin: CGPoint,
+    size: CGSize,
+    visibleFrame: CGRect,
+    pinToBottom: Bool
+) -> Bool {
     // Exit fullscreen / unminimize if needed.
     if copyBool(element, kAXMinimizedAttribute as String) == true {
         AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
@@ -402,12 +487,35 @@ func setFrame(_ element: AXUIElement, origin: CGPoint, size: CGSize) -> Bool {
             AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, axValueSize(size))
         }
 
+        // Apps can enforce a minimum size larger than the requested grid cell.
+        // In particular, ChatGPT/Codex currently clamps half-height windows to
+        // about 600 points. Pin the final row to the display's bottom edge using
+        // the actual resulting height so its controls do not extend off-screen.
+        // Repeat once because moving the window can cause AppKit to re-clamp it.
+        var adjustedOrigin = origin
+        for _ in 0..<2 {
+            guard let actualSize = copySize(element, kAXSizeAttribute as String) else {
+                break
+            }
+            let lowestAllowedY = visibleFrame.maxY - actualSize.height
+            let adjustedY = pinToBottom
+                ? lowestAllowedY
+                : min(adjustedOrigin.y, lowestAllowedY)
+            adjustedOrigin.y = max(visibleFrame.minY, adjustedY).rounded()
+            AXUIElementSetAttributeValue(
+                element,
+                kAXPositionAttribute as CFString,
+                axValuePoint(adjustedOrigin)
+            )
+        }
+
         // Verify roughly on-target (tolerance for window chrome rounding).
         // Some apps (e.g. ChatGPT) clamp size to a minimum; position still counts
         // as a successful tile when the frame origin landed.
         let pos = copyPoint(element, kAXPositionAttribute as String) ?? .zero
         let sz = copySize(element, kAXSizeAttribute as String) ?? .zero
-        let posOK = abs(pos.x - origin.x) < 40 && abs(pos.y - origin.y) < 40
+        let posOK = abs(pos.x - adjustedOrigin.x) < 40
+            && abs(pos.y - adjustedOrigin.y) < 40
         let sizeOK = abs(sz.width - size.width) < 80 && abs(sz.height - size.height) < 80
         let sizeClampedOK = posOK
             && sz.width >= 50 && sz.height >= 50
@@ -446,11 +554,6 @@ func standardWindows(pid: pid_t) -> [AXUIElement] {
             continue
         }
 
-        if copyBool(win, kAXMinimizedAttribute as String) == true {
-            // Still include after we unminimize during setFrame, but try now.
-            AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-        }
-
         guard let size = copySize(win, kAXSizeAttribute as String),
               size.width >= 50, size.height >= 50 else {
             continue
@@ -472,6 +575,14 @@ if apps.isEmpty {
     exit(0)
 }
 
+// Capture the destination before activating either target app. This matters for
+// Raycast, whose silent command can briefly change the frontmost application.
+let screen = targetScreen()
+guard let primary = NSScreen.screens.first else {
+    die("no screens available")
+}
+let frame = axVisibleFrame(of: screen, primary: primary)
+
 // Activate target apps so windows are on-screen / AX-ready.
 var activated = Set<String>()
 for e in apps {
@@ -486,6 +597,9 @@ Thread.sleep(forTimeInterval: 0.05)
 var windows: [TiledWindow] = []
 for e in apps {
     for el in standardWindows(pid: e.pid) {
+        guard windowIsOnScreen(el, screen: screen, primary: primary) else {
+            continue
+        }
         windows.append(TiledWindow(
             element: el,
             pid: e.pid,
@@ -498,17 +612,11 @@ if windows.isEmpty {
     exit(0)
 }
 
-let screen = targetScreen()
-guard let primary = NSScreen.screens.first else {
-    die("no screens available")
-}
-let frame = axVisibleFrame(of: screen, primary: primary)
-
 // Layout by window count:
 //   1     → 1×1 (full visible frame)
 //   2     → 1×2 (full-height halves)
 //   3     → 1×3 (full-height thirds)
-//   4     → 2×2 quarters
+//   4     → 1×4 fourths
 //   5–6   → 2×3 sixths
 //   7–8   → 2×4 eighths
 //   9–12+ → 3×4 twelfths (cap 12)
@@ -525,8 +633,8 @@ case 3:
     cols = 3
     rows = 1
 case 4:
-    cols = 2
-    rows = 2
+    cols = 4
+    rows = 1
 case 5, 6:
     cols = 3
     rows = 2
@@ -559,7 +667,13 @@ for i in 0..<tileCount {
     let origin = CGPoint(x: x.rounded(), y: y.rounded())
     let size = CGSize(width: w.rounded(), height: h.rounded())
 
-    if setFrame(tiledWindows[i].element, origin: origin, size: size) {
+    if setFrame(
+        tiledWindows[i].element,
+        origin: origin,
+        size: size,
+        visibleFrame: frame,
+        pinToBottom: row == rows - 1
+    ) {
         ok += 1
     } else {
         fail += 1
@@ -588,6 +702,6 @@ for w in tiledWindows {
         appNames.append(w.activateName)
     }
 }
-scheduleDeferredRaise(appNames: appNames)
+scheduleDeferredRaise(appNames: appNames, frame: frame)
 
 exit(0)

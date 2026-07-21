@@ -2,7 +2,7 @@
 
 ## Overview
 
-Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on macOS into a shared fixed grid, then raise those windows and activate the apps.
+Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on one macOS display into a shared fixed grid, then raise those windows and activate the apps.
 
 Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency and no other third-party packages.
 
@@ -11,7 +11,7 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 | 1 | 1×1 full visible frame | all |
 | 2 | 1×2 halves (full height) | all |
 | 3 | 1×3 thirds (full height) | all |
-| 4 | 2×2 quarters | all |
+| 4 | 1×4 fourths (full height) | all |
 | 5–6 | 2×3 sixths | all |
 | 7–8 | 2×4 eighths | all |
 | 9–12 | 3×4 twelfths | all |
@@ -33,7 +33,7 @@ chmod +x bin/tile-ghostty raycast/tile-ghostty.sh
 ./bin/tile-ghostty
 ```
 
-Open one or more Ghostty and/or ChatGPT windows, put the mouse on the target display, then run the command again. The host process must grant **Accessibility** (Terminal, Raycast, etc.) on first run.
+Open one or more Ghostty and/or ChatGPT windows, put the mouse on the target display, then run the command again. Only matching windows already on that display participate, so each monitor can have its own independent layout. A window spanning displays belongs to the display containing most of its frame. The host process must grant **Accessibility** (Terminal, Raycast, etc.) on first run.
 
 For keyboard-driven use day to day, set up Raycast below.
 
@@ -54,8 +54,8 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 
 ## How it works
 
-1. Finds running **Ghostty** and **ChatGPT** processes and their Accessibility (AX) windows.
-2. Reads the **visible frame** of the display under the mouse (excludes menu bar / dock).
+1. Captures the focused Ghostty/ChatGPT window's display when invoked directly; otherwise it uses the display under the mouse (the normal Raycast path). It reads that display's **visible frame**, excluding the menu bar and Dock.
+2. Finds running **Ghostty** and **ChatGPT** processes, then keeps only Accessibility (AX) windows currently on that display.
 3. Chooses a grid by combined window count (see table in Overview).
 4. Sets each window’s `AXPosition` / `AXSize`.
 5. Raises tiled windows without focus thrash: each target app is activated **once** with all windows, then that app’s tiles are `AXRaise`d while it is frontmost (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot re-raise runs after exit so Raycast/Terminal does not keep focus.
