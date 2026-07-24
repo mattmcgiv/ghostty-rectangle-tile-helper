@@ -22,7 +22,7 @@ Thanks for your interest in improving this project. **Pull requests are welcome.
 - The tiler is a single executable Swift script: `bin/tile-ghostty` (`#!/usr/bin/swift`).
 - Raycast entry point: `raycast/tile-ghostty.sh` (must stay executable; keep `@raycast.*` metadata intact).
 - Prefer AppKit + Accessibility only—no third-party window managers or packages.
-- Layout rules live near the top of `bin/tile-ghostty` and in the README Overview table; keep them in sync.
+- Layout rules live near the top of `bin/tile-ghostty` and in the README Overview; keep pure-grid tables and ChatGPT-reserve behavior in sync.
 
 ### Quick local check
 

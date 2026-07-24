@@ -2,7 +2,9 @@
 // tile-ghostty — Tile open Ghostty (+ ChatGPT) windows into a grid.
 //
 // Collects standard windows from Ghostty and the ChatGPT macOS app on the
-// selected display, then tiles them together with the same grid rules as before:
+// selected display, then tiles them.
+//
+// Pure Ghostty (or pure ChatGPT) uses a fixed grid by window count:
 //
 // 1 window    → 1×1 full visible frame
 // 2 windows   → 1×2 halves (L, R)
@@ -12,14 +14,18 @@
 // 7–8 windows → 2×4 eighths (row-major)
 // 9–12 windows → 3×4 twelfths (max 12; row-major)
 //
-// Window order: Ghostty first (AX order), then ChatGPT (AX order).
+// Mixed Ghostty + ChatGPT: ChatGPT is placed first into a reserved region that
+// meets its enforced minimum size (~480×600). Ghostty then uses the same grid
+// rules inside the remaining rectangle (right-strip preferred, else bottom).
 //
 // Uses macOS Accessibility + AppKit only (no Rectangle). Direct AX frame
 // sets avoid the frontmost-window races that stacked tiles in the top-left
 // and failed with System Events -10006 when tiling more than 4 windows.
 //
 // Env:
-//   TILE_GHOSTTY_SETTLE  Seconds between window placements (default: 0.03)
+//   TILE_GHOSTTY_SETTLE         Seconds between window placements (default: 0.03)
+//   TILE_CHATGPT_MIN_WIDTH      ChatGPT min width to reserve (default: 480)
+//   TILE_CHATGPT_MIN_HEIGHT     ChatGPT min height to reserve (default: 600)
 
 import AppKit
 import ApplicationServices
@@ -457,7 +463,8 @@ func setFrame(
     _ element: AXUIElement,
     origin: CGPoint,
     size: CGSize,
-    visibleFrame: CGRect,
+    /// Region this window may occupy (full display or a reserved/remainder rect).
+    bounds: CGRect,
     pinToBottom: Bool
 ) -> Bool {
     // Exit fullscreen / unminimize if needed.
@@ -488,20 +495,23 @@ func setFrame(
         }
 
         // Apps can enforce a minimum size larger than the requested grid cell.
-        // In particular, ChatGPT/Codex currently clamps half-height windows to
-        // about 600 points. Pin the final row to the display's bottom edge using
-        // the actual resulting height so its controls do not extend off-screen.
+        // In particular, ChatGPT/Codex currently clamps below about 480×600.
+        // Pin the final row to the *bounds* bottom using the actual height so
+        // controls stay inside the reserved/remainder region (not over a sibling strip).
         // Repeat once because moving the window can cause AppKit to re-clamp it.
         var adjustedOrigin = origin
         for _ in 0..<2 {
             guard let actualSize = copySize(element, kAXSizeAttribute as String) else {
                 break
             }
-            let lowestAllowedY = visibleFrame.maxY - actualSize.height
+            let lowestAllowedY = bounds.maxY - actualSize.height
             let adjustedY = pinToBottom
                 ? lowestAllowedY
                 : min(adjustedOrigin.y, lowestAllowedY)
-            adjustedOrigin.y = max(visibleFrame.minY, adjustedY).rounded()
+            adjustedOrigin.y = max(bounds.minY, adjustedY).rounded()
+            // Also keep left edge from sliding past bounds when width clamps.
+            let rightLimitX = bounds.maxX - actualSize.width
+            adjustedOrigin.x = min(max(bounds.minX, adjustedOrigin.x), max(bounds.minX, rightLimitX)).rounded()
             AXUIElementSetAttributeValue(
                 element,
                 kAXPositionAttribute as CFString,
@@ -563,6 +573,284 @@ func standardWindows(pid: pid_t) -> [AXUIElement] {
     return result
 }
 
+// MARK: - Layout
+
+struct GridSpec {
+    let cols: Int
+    let rows: Int
+}
+
+/// Fixed grid by window count (Ghostty and single-app ChatGPT).
+func gridForCount(_ count: Int) -> GridSpec {
+    switch count {
+    case 1: return GridSpec(cols: 1, rows: 1)
+    case 2: return GridSpec(cols: 2, rows: 1)
+    case 3: return GridSpec(cols: 3, rows: 1)
+    case 4: return GridSpec(cols: 4, rows: 1)
+    case 5, 6: return GridSpec(cols: 3, rows: 2)
+    case 7, 8: return GridSpec(cols: 4, rows: 2)
+    default: return GridSpec(cols: 4, rows: 3) // 9+ → 3×4 (cap 12 at place time)
+    }
+}
+
+func envCGFloat(_ key: String, default def: CGFloat) -> CGFloat {
+    guard let raw = ProcessInfo.processInfo.environment[key],
+          let value = Double(raw),
+          value > 0 else {
+        return def
+    }
+    return CGFloat(value)
+}
+
+/// ChatGPT/Codex enforces roughly 480×600 (measured). Overridable via env.
+func chatGPTMinSize() -> CGSize {
+    CGSize(
+        width: envCGFloat("TILE_CHATGPT_MIN_WIDTH", default: 480),
+        height: envCGFloat("TILE_CHATGPT_MIN_HEIGHT", default: 600)
+    )
+}
+
+func isChatGPTWindow(_ window: TiledWindow) -> Bool {
+    window.activateName == "ChatGPT"
+}
+
+struct PlaceResult {
+    var ok = 0
+    var fail = 0
+    var tiled: [TiledWindow] = []
+    var label = ""
+
+    mutating func merge(_ other: PlaceResult) {
+        ok += other.ok
+        fail += other.fail
+        tiled.append(contentsOf: other.tiled)
+    }
+}
+
+/// Tile `windows` into `rect` with a row-major `cols`×`rows` grid (cap at cols*rows).
+func placeWindowsInRect(
+    _ windows: [TiledWindow],
+    rect: CGRect,
+    cols: Int,
+    rows: Int,
+    label: String
+) -> PlaceResult {
+    var result = PlaceResult()
+    result.label = label
+    let tileCount = min(windows.count, cols * rows)
+    guard tileCount > 0, cols > 0, rows > 0, rect.width >= 50, rect.height >= 50 else {
+        return result
+    }
+
+    let cellW = floor(rect.width / CGFloat(cols))
+    let cellH = floor(rect.height / CGFloat(rows))
+
+    for i in 0..<tileCount {
+        let col = i % cols
+        let row = i / cols
+
+        let x = rect.minX + CGFloat(col) * cellW
+        let y = rect.minY + CGFloat(row) * cellH
+        let w = (col == cols - 1) ? (rect.maxX - x) : cellW
+        let h = (row == rows - 1) ? (rect.maxY - y) : cellH
+
+        let origin = CGPoint(x: x.rounded(), y: y.rounded())
+        let size = CGSize(width: w.rounded(), height: h.rounded())
+        let window = windows[i]
+
+        // Pin/clamp inside `rect` so remainder grids do not spill into a ChatGPT strip.
+        if setFrame(
+            window.element,
+            origin: origin,
+            size: size,
+            bounds: rect,
+            pinToBottom: row == rows - 1
+        ) {
+            result.ok += 1
+            result.tiled.append(window)
+        } else {
+            result.fail += 1
+            fputs(
+                "tile-ghostty: failed to place \(label) window \(i + 1) at \(Int(origin.x)),\(Int(origin.y)) \(Int(size.width))x\(Int(size.height))\n",
+                stderr
+            )
+        }
+        settleDelay()
+    }
+    return result
+}
+
+/// Prefer full-height columns, then full-width rows, then best-fit for min size.
+func chatGrid(count: Int, rect: CGRect, minSize: CGSize) -> GridSpec {
+    let n = max(1, min(count, 12))
+    if CGFloat(n) * minSize.width <= rect.width + 0.5, rect.height + 0.5 >= minSize.height {
+        return GridSpec(cols: n, rows: 1)
+    }
+    if CGFloat(n) * minSize.height <= rect.height + 0.5, rect.width + 0.5 >= minSize.width {
+        return GridSpec(cols: 1, rows: n)
+    }
+
+    var best = gridForCount(n)
+    var bestScore: CGFloat = -1
+    for cols in 1...n {
+        let rows = (n + cols - 1) / cols
+        let cellW = rect.width / CGFloat(cols)
+        let cellH = rect.height / CGFloat(rows)
+        let meets = cellW + 0.5 >= minSize.width && cellH + 0.5 >= minSize.height
+        let score = (meets ? 1_000_000 : 0) as CGFloat + cellW * cellH
+        if score > bestScore {
+            bestScore = score
+            best = GridSpec(cols: cols, rows: rows)
+        }
+    }
+    return best
+}
+
+struct ReservedLayout {
+    let chatRect: CGRect
+    let remainder: CGRect
+    let chatCols: Int
+    let chatRows: Int
+}
+
+/// Reserve a contiguous region for ChatGPT that respects min size; remainder is for Ghostty.
+func reserveChatGPTRegion(
+    frame: CGRect,
+    chatCount: Int,
+    ghosttyCount: Int,
+    minSize: CGSize
+) -> ReservedLayout {
+    let chatN = max(1, chatCount)
+    let ghostN = ghosttyCount
+    let minW = minSize.width
+    let minH = minSize.height
+
+    if ghostN == 0 {
+        let grid = chatGrid(count: chatN, rect: frame, minSize: minSize)
+        return ReservedLayout(
+            chatRect: frame,
+            remainder: .null,
+            chatCols: grid.cols,
+            chatRows: grid.rows
+        )
+    }
+
+    // Prefer a right strip (ChatGPT as sidebar). Stack vertically when each row can be ≥ minH.
+    let canStack = frame.height / CGFloat(chatN) + 0.5 >= minH
+    if canStack {
+        let fair = floor(frame.width / CGFloat(ghostN + 1))
+        var stripW = max(minW, fair)
+        // Keep a usable Ghostty region when the display is wide enough.
+        let ghostFloor = min(frame.width * 0.4, frame.width - minW)
+        if ghostFloor >= 200 {
+            stripW = min(stripW, frame.width - ghostFloor)
+            stripW = max(stripW, minW)
+        }
+        if stripW <= frame.width - 80 {
+            let chatRect = CGRect(
+                x: frame.maxX - stripW,
+                y: frame.minY,
+                width: stripW,
+                height: frame.height
+            )
+            let remainder = CGRect(
+                x: frame.minX,
+                y: frame.minY,
+                width: frame.width - stripW,
+                height: frame.height
+            )
+            return ReservedLayout(
+                chatRect: chatRect,
+                remainder: remainder,
+                chatCols: 1,
+                chatRows: chatN
+            )
+        }
+    }
+
+    // Side-by-side ChatGPT panes in a wider right strip (when stacking is too short).
+    let sideBySideMinW = minW * CGFloat(chatN)
+    if sideBySideMinW <= frame.width - 200, frame.height + 0.5 >= minH {
+        let fair = floor(frame.width * CGFloat(chatN) / CGFloat(chatN + max(ghostN, 1)))
+        var stripW = max(sideBySideMinW, fair)
+        let ghostFloor = min(frame.width * 0.35, frame.width - sideBySideMinW)
+        if ghostFloor >= 150 {
+            stripW = min(stripW, frame.width - ghostFloor)
+            stripW = max(stripW, sideBySideMinW)
+        }
+        if stripW <= frame.width - 80 {
+            let chatRect = CGRect(
+                x: frame.maxX - stripW,
+                y: frame.minY,
+                width: stripW,
+                height: frame.height
+            )
+            let remainder = CGRect(
+                x: frame.minX,
+                y: frame.minY,
+                width: frame.width - stripW,
+                height: frame.height
+            )
+            return ReservedLayout(
+                chatRect: chatRect,
+                remainder: remainder,
+                chatCols: chatN,
+                chatRows: 1
+            )
+        }
+    }
+
+    // Bottom strip: full width, height ≥ minH; ChatGPT tiles inside it.
+    var stripH = max(minH, floor(frame.height / 2))
+    if ghostN > 0 {
+        stripH = min(stripH, max(minH, floor(frame.height * 0.5)))
+        stripH = max(stripH, minH)
+    }
+    if stripH <= frame.height - 80 {
+        let chatRect = CGRect(
+            x: frame.minX,
+            y: frame.maxY - stripH,
+            width: frame.width,
+            height: stripH
+        )
+        let remainder = CGRect(
+            x: frame.minX,
+            y: frame.minY,
+            width: frame.width,
+            height: frame.height - stripH
+        )
+        let grid = chatGrid(count: chatN, rect: chatRect, minSize: minSize)
+        return ReservedLayout(
+            chatRect: chatRect,
+            remainder: remainder,
+            chatCols: grid.cols,
+            chatRows: grid.rows
+        )
+    }
+
+    // Last resort: min-width right strip (may leave a narrow Ghostty band).
+    let stripW = min(max(minW, 1), frame.width)
+    let chatRect = CGRect(
+        x: frame.maxX - stripW,
+        y: frame.minY,
+        width: stripW,
+        height: frame.height
+    )
+    let remainder = CGRect(
+        x: frame.minX,
+        y: frame.minY,
+        width: max(0, frame.width - stripW),
+        height: frame.height
+    )
+    let grid = chatGrid(count: chatN, rect: chatRect, minSize: minSize)
+    return ReservedLayout(
+        chatRect: chatRect,
+        remainder: remainder,
+        chatCols: grid.cols,
+        chatRows: grid.rows
+    )
+}
+
 // MARK: - Main
 
 if !axTrusted() {
@@ -612,85 +900,93 @@ if windows.isEmpty {
     exit(0)
 }
 
-// Layout by window count:
-//   1     → 1×1 (full visible frame)
-//   2     → 1×2 (full-height halves)
-//   3     → 1×3 (full-height thirds)
-//   4     → 1×4 fourths
-//   5–6   → 2×3 sixths
-//   7–8   → 2×4 eighths
-//   9–12+ → 3×4 twelfths (cap 12)
-let cols: Int
-let rows: Int
-switch windows.count {
-case 1:
-    cols = 1
-    rows = 1
-case 2:
-    cols = 2
-    rows = 1
-case 3:
-    cols = 3
-    rows = 1
-case 4:
-    cols = 4
-    rows = 1
-case 5, 6:
-    cols = 3
-    rows = 2
-case 7, 8:
-    cols = 4
-    rows = 2
-default:
-    // 9+ windows → 3×4 (cap at 12 via tileCount)
-    cols = 4
-    rows = 3
-}
+let ghosttyWindows = windows.filter { !isChatGPTWindow($0) }
+let chatWindows = windows.filter { isChatGPTWindow($0) }
+let minChat = chatGPTMinSize()
 
-let tileCount = min(windows.count, cols * rows)
-let tiledWindows = Array(windows.prefix(tileCount))
-let cellW = floor(frame.width / CGFloat(cols))
-let cellH = floor(frame.height / CGFloat(rows))
+var place = PlaceResult()
+var layoutNote = ""
 
-var ok = 0
-var fail = 0
+if chatWindows.isEmpty {
+    // Pure Ghostty: existing shared grid.
+    let grid = gridForCount(ghosttyWindows.count)
+    place = placeWindowsInRect(
+        ghosttyWindows,
+        rect: frame,
+        cols: grid.cols,
+        rows: grid.rows,
+        label: "Ghostty"
+    )
+    layoutNote = "grid:\(grid.cols)x\(grid.rows)"
+} else if ghosttyWindows.isEmpty {
+    // Pure ChatGPT: grid biased to satisfy min width/height.
+    let grid = chatGrid(count: chatWindows.count, rect: frame, minSize: minChat)
+    place = placeWindowsInRect(
+        chatWindows,
+        rect: frame,
+        cols: grid.cols,
+        rows: grid.rows,
+        label: "ChatGPT"
+    )
+    layoutNote = "chatgpt-grid:\(grid.cols)x\(grid.rows) min:\(Int(minChat.width))x\(Int(minChat.height))"
+} else {
+    // Mixed: reserve ChatGPT first, then flow Ghostty grid into the remainder.
+    let reserved = reserveChatGPTRegion(
+        frame: frame,
+        chatCount: chatWindows.count,
+        ghosttyCount: ghosttyWindows.count,
+        minSize: minChat
+    )
 
-for i in 0..<tileCount {
-    let col = i % cols
-    let row = i / cols
+    let chatPlace = placeWindowsInRect(
+        chatWindows,
+        rect: reserved.chatRect,
+        cols: reserved.chatCols,
+        rows: reserved.chatRows,
+        label: "ChatGPT"
+    )
+    place.merge(chatPlace)
 
-    let x = frame.minX + CGFloat(col) * cellW
-    let y = frame.minY + CGFloat(row) * cellH
-    let w = (col == cols - 1) ? (frame.maxX - x) : cellW
-    let h = (row == rows - 1) ? (frame.maxY - y) : cellH
-
-    let origin = CGPoint(x: x.rounded(), y: y.rounded())
-    let size = CGSize(width: w.rounded(), height: h.rounded())
-
-    if setFrame(
-        tiledWindows[i].element,
-        origin: origin,
-        size: size,
-        visibleFrame: frame,
-        pinToBottom: row == rows - 1
-    ) {
-        ok += 1
+    if !reserved.remainder.isNull, reserved.remainder.width >= 50, reserved.remainder.height >= 50 {
+        let gGrid = gridForCount(ghosttyWindows.count)
+        let ghostPlace = placeWindowsInRect(
+            ghosttyWindows,
+            rect: reserved.remainder,
+            cols: gGrid.cols,
+            rows: gGrid.rows,
+            label: "Ghostty"
+        )
+        place.merge(ghostPlace)
+        layoutNote =
+            "chatgpt:\(Int(reserved.chatRect.width))x\(Int(reserved.chatRect.height))"
+            + "@\(Int(reserved.chatRect.minX)),\(Int(reserved.chatRect.minY))"
+            + " \(reserved.chatCols)x\(reserved.chatRows)"
+            + " ghostty-grid:\(gGrid.cols)x\(gGrid.rows)"
+            + " remainder:\(Int(reserved.remainder.width))x\(Int(reserved.remainder.height))"
     } else {
-        fail += 1
-        fputs("tile-ghostty: failed to place window \(i + 1) at \(Int(origin.x)),\(Int(origin.y)) \(Int(size.width))x\(Int(size.height))\n", stderr)
+        layoutNote =
+            "chatgpt-only-reserved:\(Int(reserved.chatRect.width))x\(Int(reserved.chatRect.height))"
     }
-    settleDelay()
 }
+
+let tiledWindows = place.tiled
+let ok = place.ok
+let fail = place.fail
+let tileCount = ok + fail
 
 if ok == 0 {
-    die("failed to place any of \(tileCount) windows")
+    die("failed to place any of \(max(tileCount, windows.count)) windows")
 }
 
 if fail > 0 {
-    fputs("tile-ghostty: partial success — tiled:\(ok)/\(tileCount) grid:\(cols)x\(rows) fails:\(fail)\n", stderr)
+    fputs(
+        "tile-ghostty: partial success — tiled:\(ok)/\(tileCount) \(layoutNote) fails:\(fail)\n",
+        stderr
+    )
 }
 
 // Raise every tiled window above non-target apps (multi-app aware).
+// Order: Ghostty first in list still OK — bringTargetsForward activates ChatGPT then Ghostty.
 bringTargetsForward(tiledWindows)
 
 // Detached re-raise after this process exits. Raycast/Terminal/Shortcuts often

@@ -2,11 +2,13 @@
 
 ## Overview
 
-Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on one macOS display into a shared fixed grid, then raise those windows and activate the apps.
+Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on one macOS display, then raise those windows and activate the apps.
 
 Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency and no other third-party packages.
 
-| Open windows (Ghostty + ChatGPT) | Layout | Max tiled |
+### Pure Ghostty (or pure ChatGPT)
+
+| Open windows | Layout | Max tiled |
 |---|---|---|
 | 1 | 1×1 full visible frame | all |
 | 2 | 1×2 halves (full height) | all |
@@ -17,7 +19,17 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 | 9–12 | 3×4 twelfths | all |
 | 13+ | 3×4 twelfths | first 12 |
 
-**Window order:** Ghostty windows first (Accessibility order), then ChatGPT windows.
+Pure ChatGPT prefers full-height columns (or full-width rows) so cells stay at or above ChatGPT’s enforced minimum size (~480×600).
+
+### Mixed Ghostty + ChatGPT
+
+ChatGPT is laid out **first** into a reserved region that meets its minimum size, then Ghostty uses the usual grid rules in the **remaining** rectangle:
+
+1. **Right strip** (preferred) — ChatGPT as a full-height sidebar (≥480pt wide; stacked vertically when each pane can be ≥600pt tall).
+2. **Wider right strip** — multiple ChatGPT windows side-by-side when stacking would be shorter than the minimum height.
+3. **Bottom strip** — full-width band (≥600pt tall) when a right strip would leave too little room.
+
+Ghostty windows then tile inside whatever rectangle is left (1×1 through 3×4 as in the table above).
 
 **Requirements**
 
@@ -56,7 +68,7 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 
 1. Captures the focused Ghostty/ChatGPT window's display when invoked directly; otherwise it uses the display under the mouse (the normal Raycast path). It reads that display's **visible frame**, excluding the menu bar and Dock.
 2. Finds running **Ghostty** and **ChatGPT** processes, then keeps only Accessibility (AX) windows currently on that display.
-3. Chooses a grid by combined window count (see table in Overview).
+3. **Layout:** If only one app is present, uses the count-based grid (ChatGPT biased toward min-size cells). If both are present, **reserves space for ChatGPT first**, then runs the Ghostty grid in the remaining rectangle.
 4. Sets each window’s `AXPosition` / `AXSize`.
 5. Raises tiled windows without focus thrash: each target app is activated **once** with all windows, then that app’s tiles are `AXRaise`d while it is frontmost (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot re-raise runs after exit so Raycast/Terminal does not keep focus.
 
@@ -65,11 +77,15 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 | Env var | Default | Meaning |
 |---|---|---|
 | `TILE_GHOSTTY_SETTLE` | `0.03` | Pause between window placements (seconds). |
+| `TILE_CHATGPT_MIN_WIDTH` | `480` | Minimum width reserved for each ChatGPT tile (app-enforced floor). |
+| `TILE_CHATGPT_MIN_HEIGHT` | `600` | Minimum height reserved for each ChatGPT tile (app-enforced floor). |
 
 To pass env from Raycast, edit `raycast/tile-ghostty.sh`:
 
 ```sh
 export TILE_GHOSTTY_SETTLE=0.08
+export TILE_CHATGPT_MIN_WIDTH=480
+export TILE_CHATGPT_MIN_HEIGHT=600
 exec "$TILER"
 ```
 
@@ -81,6 +97,7 @@ exec "$TILER"
 - **Partial layout:** Increase `TILE_GHOSTTY_SETTLE`; check stderr for `fails:`.
 - **Apps not frontmost / some tiles buried:** Ensure Accessibility is granted for the host. The script activates each target app once and raises its tiles; only one app can be key (Ghostty when present), but both should sit above other apps. Re-run after dismissing ChatGPT floating dialogs (e.g. Computer Use) if they cover tiles.
 - **ChatGPT ignored:** Confirm the desktop app process is named **ChatGPT** (bundle `com.openai.codex`). Only standard windows are tiled.
+- **ChatGPT still overlaps / too small:** The desktop app clamps below ~480×600. Raise `TILE_CHATGPT_MIN_WIDTH` / `TILE_CHATGPT_MIN_HEIGHT` if a newer build requires more, or free vertical space so a right-strip stack can use full height.
 
 ## Contributing
 

@@ -8,7 +8,7 @@
 
 # Optional parameters:
 # @raycast.icon 🖥️
-# @raycast.description Tile open Ghostty and ChatGPT windows together (1×1–3×4 grids up to 12)
+# @raycast.description Tile Ghostty + ChatGPT (ChatGPT reserved first; Ghostty grids in remainder)
 
 set -euo pipefail
 
