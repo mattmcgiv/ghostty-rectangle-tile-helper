@@ -21,15 +21,34 @@ Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency an
 
 Pure ChatGPT prefers full-height columns (or full-width rows) so cells stay at or above ChatGPT’s enforced minimum size (~480×600).
 
-### Mixed Ghostty + ChatGPT
+### Mixed Ghostty + ChatGPT/Codex
 
-ChatGPT is laid out **first** into a reserved region that meets its minimum size, then Ghostty uses the usual grid rules in the **remaining** rectangle:
+ChatGPT/Codex cells always reserve at least the app minimum (~480×600, overridable via env).
 
-1. **Right strip** (preferred) — ChatGPT as a full-height sidebar (≥480pt wide; stacked vertically when each pane can be ≥600pt tall).
-2. **Wider right strip** — multiple ChatGPT windows side-by-side when stacking would be shorter than the minimum height.
+#### Single Codex window (preferred)
+
+Totals below count every tiled window (Ghostty + Codex). Totals 2–4 put Codex on the **left**; totals 5+ use a **bottom** Codex band:
+
+| Total windows | Layout |
+|---|---|
+| 2 (1 Ghostty + 1 Codex) | Side by side: Codex left half, Ghostty right half |
+| 3 (2 Ghostty + 1 Codex) | Codex left half (full height); right half: two Ghostty stacked |
+| 4 (3 Ghostty + 1 Codex) | Codex left half; right: one Ghostty in the top-right quarter, two Ghostty side-by-side in the bottom-right |
+| 5 (4 Ghostty + 1 Codex) | Top: 2×2 Ghostty; bottom: Codex full width |
+| 6 (5 Ghostty + 1 Codex) | 2×3 cells — Codex bottom-left; Ghostty in the other five |
+| 7+ (6+ Ghostty + 1 Codex) | Bottom: Codex full width; top: Ghostty grid (same pure-grid table) |
+
+Left Codex strips (totals 2–4) use at least `TILE_CHATGPT_MIN_WIDTH` and full height (at least `TILE_CHATGPT_MIN_HEIGHT`), preferring about half the display width when there is room. Bottom bands (totals 5+) use at least `TILE_CHATGPT_MIN_HEIGHT`. If the display cannot meet Codex’s minimum size, the tiler falls back to the multi-Codex strip logic below.
+
+#### Multiple Codex windows
+
+ChatGPT/Codex is laid out **first** into a reserved strip that meets its minimum size, then Ghostty uses the usual grid rules in the **remaining** rectangle:
+
+1. **Right strip** (preferred) — full-height sidebar (≥480pt wide; stacked vertically when each pane can be ≥600pt tall).
+2. **Wider right strip** — side-by-side when stacking would be shorter than the minimum height.
 3. **Bottom strip** — full-width band (≥600pt tall) when a right strip would leave too little room.
 
-Ghostty windows then tile inside whatever rectangle is left (1×1 through 3×4 as in the table above).
+Ghostty windows then tile inside whatever rectangle is left (1×1 through 3×4 as in the pure-grid table).
 
 **Requirements**
 
@@ -68,7 +87,7 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 
 1. Captures the focused Ghostty/ChatGPT window's display when invoked directly; otherwise it uses the display under the mouse (the normal Raycast path). It reads that display's **visible frame**, excluding the menu bar and Dock.
 2. Finds running **Ghostty** and **ChatGPT** processes, then keeps only Accessibility (AX) windows currently on that display.
-3. **Layout:** If only one app is present, uses the count-based grid (ChatGPT biased toward min-size cells). If both are present, **reserves space for ChatGPT first**, then runs the Ghostty grid in the remaining rectangle.
+3. **Layout:** If only one app is present, uses the count-based grid (ChatGPT biased toward min-size cells). If both are present with **one** ChatGPT/Codex window, uses the single-Codex mixed layouts (left strip for totals 2–4, bottom band for 5+). With **multiple** ChatGPT windows, **reserves a strip for ChatGPT first**, then runs the Ghostty grid in the remaining rectangle.
 4. Sets each window’s `AXPosition` / `AXSize`.
 5. Raises tiled windows without focus thrash: each target app is activated **once** with all windows, then that app’s tiles are `AXRaise`d while it is frontmost (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot re-raise runs after exit so Raycast/Terminal does not keep focus.
 
@@ -97,7 +116,7 @@ exec "$TILER"
 - **Partial layout:** Increase `TILE_GHOSTTY_SETTLE`; check stderr for `fails:`.
 - **Apps not frontmost / some tiles buried:** Ensure Accessibility is granted for the host. The script activates each target app once and raises its tiles; only one app can be key (Ghostty when present), but both should sit above other apps. Re-run after dismissing ChatGPT floating dialogs (e.g. Computer Use) if they cover tiles.
 - **ChatGPT ignored:** Confirm the desktop app process is named **ChatGPT** (bundle `com.openai.codex`). Only standard windows are tiled.
-- **ChatGPT still overlaps / too small:** The desktop app clamps below ~480×600. Raise `TILE_CHATGPT_MIN_WIDTH` / `TILE_CHATGPT_MIN_HEIGHT` if a newer build requires more, or free vertical space so a right-strip stack can use full height.
+- **ChatGPT still overlaps / too small:** The desktop app clamps below ~480×600. Raise `TILE_CHATGPT_MIN_WIDTH` / `TILE_CHATGPT_MIN_HEIGHT` if a newer build requires more, or free vertical space so the bottom Codex band (single window) or right-strip stack (multiple) can meet the minimum.
 
 ## Contributing
 

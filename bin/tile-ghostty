@@ -1,8 +1,8 @@
 #!/usr/bin/swift
-// tile-ghostty — Tile open Ghostty (+ ChatGPT) windows into a grid.
+// tile-ghostty — Tile open Ghostty (+ ChatGPT/Codex) windows into a grid.
 //
-// Collects standard windows from Ghostty and the ChatGPT macOS app on the
-// selected display, then tiles them.
+// Collects standard windows from Ghostty and the ChatGPT macOS app (Codex
+// bundle) on the selected display, then tiles them.
 //
 // Pure Ghostty (or pure ChatGPT) uses a fixed grid by window count:
 //
@@ -14,9 +14,18 @@
 // 7–8 windows → 2×4 eighths (row-major)
 // 9–12 windows → 3×4 twelfths (max 12; row-major)
 //
-// Mixed Ghostty + ChatGPT: ChatGPT is placed first into a reserved region that
-// meets its enforced minimum size (~480×600). Ghostty then uses the same grid
-// rules inside the remaining rectangle (right-strip preferred, else bottom).
+// Mixed Ghostty + single Codex/ChatGPT (preferred layouts; Codex min ~480×600):
+//
+// total 2 (1G+1C) → side by side: Codex left half, Ghostty right half
+// total 3 (2G+1C) → Codex left half (full height); right half: two Ghostty stacked
+// total 4 (3G+1C) → Codex left half; right: top-right quarter one Ghostty,
+//                   bottom-right two Ghostty side-by-side
+// total 5 (4G+1C) → top: 2×2 Ghostty; bottom Codex full width
+// total 6 (5G+1C) → 2×3 cells: Ghostty in five cells, Codex bottom-left
+// total 7+        → bottom Codex full width; Ghostty gridForCount in remainder
+//
+// Multiple Codex windows still use a reserved strip (right preferred, else
+// bottom) so each Codex cell can meet the min size.
 //
 // Uses macOS Accessibility + AppKit only (no Rectangle). Direct AX frame
 // sets avoid the frontmost-window races that stacked tiles in the top-left
@@ -24,8 +33,8 @@
 //
 // Env:
 //   TILE_GHOSTTY_SETTLE         Seconds between window placements (default: 0.03)
-//   TILE_CHATGPT_MIN_WIDTH      ChatGPT min width to reserve (default: 480)
-//   TILE_CHATGPT_MIN_HEIGHT     ChatGPT min height to reserve (default: 600)
+//   TILE_CHATGPT_MIN_WIDTH      ChatGPT/Codex min width to reserve (default: 480)
+//   TILE_CHATGPT_MIN_HEIGHT     ChatGPT/Codex min height to reserve (default: 600)
 
 import AppKit
 import ApplicationServices
@@ -680,6 +689,298 @@ func placeWindowsInRect(
     return result
 }
 
+/// Place windows at explicit cell rects (for asymmetric mixed layouts).
+/// `clampBounds` limits AX size-clamp drift; defaults to each cell.
+func placeWindowsAtCells(
+    _ items: [(window: TiledWindow, cell: CGRect, pinToBottom: Bool)],
+    label: String,
+    clampBounds: CGRect? = nil
+) -> PlaceResult {
+    var result = PlaceResult()
+    result.label = label
+    for (i, item) in items.enumerated() {
+        let cell = item.cell
+        guard cell.width >= 50, cell.height >= 50 else {
+            result.fail += 1
+            continue
+        }
+        let origin = CGPoint(x: cell.minX.rounded(), y: cell.minY.rounded())
+        let size = CGSize(width: cell.width.rounded(), height: cell.height.rounded())
+        let bounds = clampBounds ?? cell
+        if setFrame(
+            item.window.element,
+            origin: origin,
+            size: size,
+            bounds: bounds,
+            pinToBottom: item.pinToBottom
+        ) {
+            result.ok += 1
+            result.tiled.append(item.window)
+        } else {
+            result.fail += 1
+            fputs(
+                "tile-ghostty: failed to place \(label) window \(i + 1) at \(Int(origin.x)),\(Int(origin.y)) \(Int(size.width))x\(Int(size.height))\n",
+                stderr
+            )
+        }
+        settleDelay()
+    }
+    return result
+}
+
+/// Left Codex strip width: at least minW, prefer ~half the display, leave room for Ghostty.
+func leftCodexStripWidth(frame: CGRect, minW: CGFloat, preferredFraction: CGFloat = 0.5) -> CGFloat {
+    let ghostFloor: CGFloat = 80
+    var stripW = max(minW, floor(frame.width * preferredFraction))
+    if frame.width - stripW < ghostFloor, frame.width > minW + ghostFloor {
+        stripW = frame.width - ghostFloor
+    }
+    stripW = max(stripW, minW)
+    stripW = min(stripW, frame.width)
+    return stripW
+}
+
+/// Split `frame` into a full-height left Codex band and a right Ghostty remainder.
+func leftCodexSplit(frame: CGRect, minW: CGFloat, minH: CGFloat, preferredFraction: CGFloat = 0.5) -> (chat: CGRect, ghostty: CGRect)? {
+    guard frame.width + 0.5 >= minW, frame.height + 0.5 >= minH else { return nil }
+    let stripW = leftCodexStripWidth(frame: frame, minW: minW, preferredFraction: preferredFraction)
+    guard stripW > 0, stripW <= frame.width + 0.5 else { return nil }
+    let chat = CGRect(
+        x: frame.minX,
+        y: frame.minY,
+        width: stripW,
+        height: frame.height
+    )
+    let ghostty = CGRect(
+        x: frame.minX + stripW,
+        y: frame.minY,
+        width: max(0, frame.width - stripW),
+        height: frame.height
+    )
+    return (chat, ghostty)
+}
+
+/// Bottom Codex strip height: at least minH, prefer ~half the display, leave room for Ghostty.
+func bottomCodexStripHeight(frame: CGRect, minH: CGFloat, preferredFraction: CGFloat = 0.5) -> CGFloat {
+    let ghostFloor: CGFloat = 80
+    var stripH = max(minH, floor(frame.height * preferredFraction))
+    if frame.height - stripH < ghostFloor, frame.height > minH + ghostFloor {
+        stripH = frame.height - ghostFloor
+    }
+    stripH = max(stripH, minH)
+    stripH = min(stripH, frame.height)
+    return stripH
+}
+
+/// Split `frame` into a full-width bottom Codex band and a top Ghostty remainder.
+func bottomCodexSplit(frame: CGRect, minH: CGFloat, preferredFraction: CGFloat = 0.5) -> (chat: CGRect, ghostty: CGRect)? {
+    guard frame.height + 0.5 >= minH else { return nil }
+    let stripH = bottomCodexStripHeight(frame: frame, minH: minH, preferredFraction: preferredFraction)
+    guard stripH > 0, stripH <= frame.height + 0.5 else { return nil }
+    let chat = CGRect(
+        x: frame.minX,
+        y: frame.maxY - stripH,
+        width: frame.width,
+        height: stripH
+    )
+    let ghostty = CGRect(
+        x: frame.minX,
+        y: frame.minY,
+        width: frame.width,
+        height: max(0, frame.height - stripH)
+    )
+    return (chat, ghostty)
+}
+
+/// 3 Ghostty in the right half (total=4): top-right quarter one pane; bottom-right two side-by-side.
+func placeGhosttyTopQuarterBottomPair(_ windows: [TiledWindow], rect: CGRect) -> PlaceResult {
+    guard windows.count >= 3, rect.width >= 50, rect.height >= 50 else {
+        return placeWindowsInRect(windows, rect: rect, cols: 1, rows: 1, label: "Ghostty")
+    }
+    let topH = floor(rect.height / 2)
+    let botH = rect.height - topH
+    let botLeftW = floor(rect.width / 2)
+    let botRightW = rect.width - botLeftW
+    let top = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: topH)
+    let botLeft = CGRect(x: rect.minX, y: rect.minY + topH, width: botLeftW, height: botH)
+    let botRight = CGRect(x: rect.minX + botLeftW, y: rect.minY + topH, width: botRightW, height: botH)
+    return placeWindowsAtCells(
+        [
+            (windows[0], top, false),
+            (windows[1], botLeft, true),
+            (windows[2], botRight, true),
+        ],
+        label: "Ghostty",
+        clampBounds: rect
+    )
+}
+
+/// Place Codex in `chatRect` and return a merged place result.
+func placeCodexCell(_ chat: TiledWindow, rect: CGRect) -> PlaceResult {
+    placeWindowsAtCells(
+        [(chat, rect, true)],
+        label: "ChatGPT",
+        clampBounds: rect
+    )
+}
+
+/// Mixed layout for exactly one Codex/ChatGPT window + N Ghostty (totals 2–6+).
+/// Returns nil when the display cannot host Codex at min size (caller falls back).
+func placeSingleCodexMixed(
+    frame: CGRect,
+    ghosttyWindows: [TiledWindow],
+    chatWindows: [TiledWindow],
+    minSize: CGSize
+) -> (place: PlaceResult, note: String)? {
+    guard chatWindows.count == 1 else { return nil }
+    let chat = chatWindows[0]
+    let ghostN = ghosttyWindows.count
+    let minW = minSize.width
+    let minH = minSize.height
+
+    guard frame.height + 0.5 >= minH, frame.width + 0.5 >= minW else { return nil }
+
+    // --- totals 2–4: Codex left half (full height); Ghostty on the right ---
+    if ghostN >= 1, ghostN <= 3 {
+        guard let split = leftCodexSplit(frame: frame, minW: minW, minH: minH) else {
+            return nil
+        }
+        guard split.chat.width + 0.5 >= minW, split.chat.height + 0.5 >= minH else {
+            return nil
+        }
+
+        var place = PlaceResult()
+        place.merge(placeCodexCell(chat, rect: split.chat))
+
+        let gRect = split.ghostty
+        var gNote = "ghostty:empty"
+        if gRect.width >= 50, gRect.height >= 50 {
+            switch ghostN {
+            case 1:
+                // total 2: side by side
+                place.merge(placeWindowsInRect(ghosttyWindows, rect: gRect, cols: 1, rows: 1, label: "Ghostty"))
+                gNote = "ghostty:right-full"
+            case 2:
+                // total 3: two Ghostty stacked in the right half
+                place.merge(placeWindowsInRect(ghosttyWindows, rect: gRect, cols: 1, rows: 2, label: "Ghostty"))
+                gNote = "ghostty:right-stack2"
+            default:
+                // total 4: top-right quarter + bottom-right pair
+                place.merge(placeGhosttyTopQuarterBottomPair(ghosttyWindows, rect: gRect))
+                gNote = "ghostty:tr-quarter+br-pair"
+            }
+        }
+
+        let note =
+            "single-codex:left-strip"
+            + " chat:\(Int(split.chat.width))x\(Int(split.chat.height))"
+            + " \(gNote)"
+            + " remainder:\(Int(gRect.width))x\(Int(gRect.height))"
+        return (place, note)
+    }
+
+    // --- total 6 (5 Ghostty + 1 Codex): 2×3 cells, Codex bottom-left ---
+    if ghostN == 5 {
+        var bottomH = max(minH, floor(frame.height / 3))
+        let topMin: CGFloat = 100
+        if frame.height - bottomH < topMin, frame.height > minH + topMin {
+            bottomH = frame.height - topMin
+        }
+        bottomH = max(bottomH, minH)
+        bottomH = min(bottomH, frame.height)
+
+        var codexW = floor(frame.width / 2)
+        if codexW + 0.5 < minW {
+            codexW = min(minW, frame.width)
+        }
+        let ghostBotW = frame.width - codexW
+        let topH = frame.height - bottomH
+        let topRect = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: topH)
+        let codexCell = CGRect(
+            x: frame.minX,
+            y: frame.maxY - bottomH,
+            width: codexW,
+            height: bottomH
+        )
+        let ghostBotCell = CGRect(
+            x: frame.minX + codexW,
+            y: frame.maxY - bottomH,
+            width: ghostBotW,
+            height: bottomH
+        )
+
+        var place = PlaceResult()
+        place.merge(placeCodexCell(chat, rect: codexCell))
+
+        if topH >= 50, ghosttyWindows.count >= 4 {
+            place.merge(placeWindowsInRect(
+                Array(ghosttyWindows.prefix(4)),
+                rect: topRect,
+                cols: 2,
+                rows: 2,
+                label: "Ghostty"
+            ))
+        }
+        if ghostBotW >= 50, ghosttyWindows.count >= 5 {
+            place.merge(placeWindowsAtCells(
+                [(ghosttyWindows[4], ghostBotCell, true)],
+                label: "Ghostty",
+                clampBounds: ghostBotCell
+            ))
+        }
+
+        let note =
+            "single-codex:2x3-codex-bl"
+            + " chat:\(Int(codexCell.width))x\(Int(codexCell.height))"
+            + " top:\(Int(topRect.width))x\(Int(topRect.height))"
+        return (place, note)
+    }
+
+    // --- totals 5 and 7+: full-width bottom Codex, Ghostty in top remainder ---
+    guard let split = bottomCodexSplit(frame: frame, minH: minH, preferredFraction: 0.5) else {
+        return nil
+    }
+    guard split.chat.height + 0.5 >= minH, split.chat.width + 0.5 >= minW else {
+        return nil
+    }
+
+    var place = PlaceResult()
+    place.merge(placeWindowsInRect(
+        chatWindows,
+        rect: split.chat,
+        cols: 1,
+        rows: 1,
+        label: "ChatGPT"
+    ))
+
+    let gRect = split.ghostty
+    var gNote = "ghostty:empty"
+    if ghostN > 0, gRect.width >= 50, gRect.height >= 50 {
+        switch ghostN {
+        case 4:
+            place.merge(placeWindowsInRect(ghosttyWindows, rect: gRect, cols: 2, rows: 2, label: "Ghostty"))
+            gNote = "ghostty:2x2"
+        default:
+            let grid = gridForCount(ghostN)
+            place.merge(placeWindowsInRect(
+                ghosttyWindows,
+                rect: gRect,
+                cols: grid.cols,
+                rows: grid.rows,
+                label: "Ghostty"
+            ))
+            gNote = "ghostty-grid:\(grid.cols)x\(grid.rows)"
+        }
+    }
+
+    let note =
+        "single-codex:bottom-strip"
+        + " chat:\(Int(split.chat.width))x\(Int(split.chat.height))"
+        + " \(gNote)"
+        + " remainder:\(Int(gRect.width))x\(Int(gRect.height))"
+    return (place, note)
+}
+
 /// Prefer full-height columns, then full-width rows, then best-fit for min size.
 func chatGrid(count: Int, rect: CGRect, minSize: CGSize) -> GridSpec {
     let n = max(1, min(count, 12))
@@ -929,8 +1230,18 @@ if chatWindows.isEmpty {
         label: "ChatGPT"
     )
     layoutNote = "chatgpt-grid:\(grid.cols)x\(grid.rows) min:\(Int(minChat.width))x\(Int(minChat.height))"
+} else if chatWindows.count == 1,
+          let mixed = placeSingleCodexMixed(
+              frame: frame,
+              ghosttyWindows: ghosttyWindows,
+              chatWindows: chatWindows,
+              minSize: minChat
+          ) {
+    // Single Codex/ChatGPT: left-strip (2–4) or bottom-band (5+) mixed layouts.
+    place = mixed.place
+    layoutNote = mixed.note
 } else {
-    // Mixed: reserve ChatGPT first, then flow Ghostty grid into the remainder.
+    // Multiple Codex windows (or single-Codex fallback): reserve strip, then Ghostty grid.
     let reserved = reserveChatGPTRegion(
         frame: frame,
         chatCount: chatWindows.count,
