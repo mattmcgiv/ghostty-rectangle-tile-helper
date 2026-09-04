@@ -2,7 +2,7 @@
 
 ## Overview
 
-Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on one macOS display, then raise those windows and activate the apps.
+Tile open [Ghostty](https://ghostty.org) and [ChatGPT](https://openai.com/chatgpt/desktop/) windows on one macOS display and the current Mission Control Space (virtual desktop), then raise those windows and activate the apps. Windows on other Spaces stay put. The Space you run the command from stays in view.
 
 Uses only system frameworks (AppKit + Accessibility). No Rectangle dependency and no other third-party packages.
 
@@ -64,7 +64,7 @@ chmod +x bin/tile-ghostty raycast/tile-ghostty.sh
 ./bin/tile-ghostty
 ```
 
-Open one or more Ghostty and/or ChatGPT windows, put the mouse on the target display, then run the command again. Only matching windows already on that display participate, so each monitor can have its own independent layout. A window spanning displays belongs to the display containing most of its frame. The host process must grant **Accessibility** (Terminal, Raycast, etc.) on first run.
+Open one or more Ghostty and/or ChatGPT windows, put the mouse on the target display, then run the command again. Only matching windows already on that display **and on the current virtual desktop** participate, so each monitor and each Space can have its own independent layout. A window spanning displays belongs to the display containing most of its frame. The host process must grant **Accessibility** (Terminal, Raycast, etc.) on first run.
 
 For keyboard-driven use day to day, set up Raycast below.
 
@@ -86,10 +86,10 @@ Search for `Tile Ghostty` in Raycast, or use your hotkey.
 ## How it works
 
 1. Captures the focused Ghostty/ChatGPT window's display when invoked directly; otherwise it uses the display under the mouse (the normal Raycast path). It reads that display's **visible frame**, excluding the menu bar and Dock.
-2. Finds running **Ghostty** and **ChatGPT** processes, then keeps only Accessibility (AX) windows currently on that display.
+2. Finds running **Ghostty** and **ChatGPT** processes, then keeps only Accessibility (AX) windows on that display **and on the current Mission Control Space**. Off-Space windows share the same display coordinates, so the tiler matches AX windows to `CGWindowList` on-screen window IDs (current Space) instead of tiling every AX window on the display.
 3. **Layout:** If only one app is present, uses the count-based grid (ChatGPT biased toward min-size cells). If both are present with **one** ChatGPT/Codex window, uses the single-Codex mixed layouts (left strip for totals 2–4, bottom band for 5+). With **multiple** ChatGPT windows, **reserves a strip for ChatGPT first**, then runs the Ghostty grid in the remaining rectangle.
 4. Sets each window’s `AXPosition` / `AXSize`.
-5. Raises tiled windows without focus thrash: each target app is activated **once** with all windows, then that app’s tiles are `AXRaise`d while it is frontmost (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot re-raise runs after exit so Raycast/Terminal does not keep focus.
+5. Raises tiled windows without switching Spaces: each target app is brought forward **once**, after a tiled window on this Space is raised and focused (ChatGPT first when present, Ghostty last so it stays key). A short delayed one-shot sets those processes frontmost after exit so Raycast/Terminal does not keep focus. The tiler does not use `activateAllWindows` or AppleScript `tell application to activate`, which would switch to Desktop 1 when the app still has a window there.
 
 ## Configuration
 
@@ -113,8 +113,9 @@ exec "$TILER"
 - **Nothing moves:** Enable **Raycast** (or your shell host) under Accessibility.
 - **Raycast does not list the command:** Confirm the `raycast/` directory is added under Script Commands → Directories, and `tile-ghostty.sh` is executable.
 - **Wrong display:** Put the mouse on the target display, then run the command.
+- **Wrong virtual desktop / switched to Desktop 1:** Run the command from the Space you want to tile. Only that Space’s windows move; other desktops are left alone. If an older copy of the script still jumps to Desktop 1, update to this version (it no longer activates every window of the app).
 - **Partial layout:** Increase `TILE_GHOSTTY_SETTLE`; check stderr for `fails:`.
-- **Apps not frontmost / some tiles buried:** Ensure Accessibility is granted for the host. The script activates each target app once and raises its tiles; only one app can be key (Ghostty when present), but both should sit above other apps. Re-run after dismissing ChatGPT floating dialogs (e.g. Computer Use) if they cover tiles.
+- **Apps not frontmost / some tiles buried:** Ensure Accessibility is granted for the host. The script brings each target app forward once and raises its tiles on this Space; only one app can be key (Ghostty when present), but both should sit above other apps. Re-run after dismissing ChatGPT floating dialogs (e.g. Computer Use) if they cover tiles.
 - **ChatGPT ignored:** Confirm the desktop app process is named **ChatGPT** (bundle `com.openai.codex`). Only standard windows are tiled.
 - **ChatGPT still overlaps / too small:** The desktop app clamps below ~480×600. Raise `TILE_CHATGPT_MIN_WIDTH` / `TILE_CHATGPT_MIN_HEIGHT` if a newer build requires more, or free vertical space so the bottom Codex band (single window) or right-strip stack (multiple) can meet the minimum.
 

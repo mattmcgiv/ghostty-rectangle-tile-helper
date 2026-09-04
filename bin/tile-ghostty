@@ -2,7 +2,8 @@
 // tile-ghostty — Tile open Ghostty (+ ChatGPT/Codex) windows into a grid.
 //
 // Collects standard windows from Ghostty and the ChatGPT macOS app (Codex
-// bundle) on the selected display, then tiles them.
+// bundle) on the selected display and the current Mission Control Space, then
+// tiles them. Windows on other virtual desktops are left alone.
 //
 // Pure Ghostty (or pure ChatGPT) uses a fixed grid by window count:
 //
@@ -38,7 +39,28 @@
 
 import AppKit
 import ApplicationServices
+import Darwin
 import Foundation
+
+/// HIServices SPI: AX element → CGWindowID. Used by Rectangle / Hammerspoon.
+/// Resolved at runtime so a missing symbol does not fail the script load.
+let axGetWindowFn: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> Int32)? = {
+    typealias Fn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> Int32
+    if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") {
+        return unsafeBitCast(sym, to: Fn.self)
+    }
+    let paths = [
+        "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices",
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+    ]
+    for path in paths {
+        if let handle = dlopen(path, RTLD_LAZY),
+           let sym = dlsym(handle, "_AXUIElementGetWindow") {
+            return unsafeBitCast(sym, to: Fn.self)
+        }
+    }
+    return nil
+}()
 
 // MARK: - Target apps
 
@@ -48,7 +70,7 @@ struct TileTarget {
     let names: Set<String>
     /// Bundle identifiers (exact, lowercased) or substrings that uniquely identify the app.
     let bundleMatchers: [String]
-    /// Name used with `tell application "…" to activate`.
+    /// Process name used to bring the app forward (System Events / AppKit).
     let activateName: String
     /// Sort key so Ghostty stays before ChatGPT when concatenating windows.
     let order: Int
@@ -284,16 +306,68 @@ func windowFrame(_ element: AXUIElement) -> CGRect? {
 }
 
 /// Assign a spanning window to the display containing the largest part of it.
-func windowIsOnScreen(_ element: AXUIElement, screen: NSScreen, primary: NSScreen) -> Bool {
-    guard let window = windowFrame(element) else { return false }
+func windowIsOnScreenRect(_ window: CGRect, screen: NSScreen, primary: NSScreen) -> Bool {
     let selectedFrame = axFrame(of: screen, primary: primary)
     let selectedArea = intersectionArea(window, selectedFrame)
     guard selectedArea > 0 else { return false }
-
     let largestArea = NSScreen.screens
         .map { intersectionArea(window, axFrame(of: $0, primary: primary)) }
         .max() ?? 0
     return selectedArea == largestArea
+}
+
+func windowIsOnScreen(_ element: AXUIElement, screen: NSScreen, primary: NSScreen) -> Bool {
+    guard let window = windowFrame(element) else { return false }
+    return windowIsOnScreenRect(window, screen: screen, primary: primary)
+}
+
+/// On-screen CG window (current Space on each display). Bounds are AX/Quartz
+/// top-left, same as `kAXPosition` / `kAXSize`.
+struct CGWindowSnap {
+    let id: CGWindowID
+    let pid: pid_t
+    let bounds: CGRect
+}
+
+func onScreenCGWindows() -> [CGWindowSnap] {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var result: [CGWindowSnap] = []
+    for w in info {
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t else { continue }
+        let layer = w[kCGWindowLayer as String] as? Int ?? 0
+        guard layer == 0 else { continue }
+        guard let num = w[kCGWindowNumber as String] as? NSNumber else { continue }
+        let id = CGWindowID(truncating: num)
+        guard id != 0 else { continue }
+        guard let b = w[kCGWindowBounds as String] as? [String: Any],
+              let x = b["X"] as? NSNumber,
+              let y = b["Y"] as? NSNumber,
+              let width = b["Width"] as? NSNumber,
+              let height = b["Height"] as? NSNumber else { continue }
+        let bounds = CGRect(
+            x: x.doubleValue,
+            y: y.doubleValue,
+            width: width.doubleValue,
+            height: height.doubleValue
+        )
+        guard bounds.width >= 50, bounds.height >= 50 else { continue }
+        result.append(CGWindowSnap(id: id, pid: pid, bounds: bounds))
+    }
+    return result
+}
+
+func axWindowID(_ element: AXUIElement) -> CGWindowID? {
+    guard let fn = axGetWindowFn else { return nil }
+    var id: CGWindowID = 0
+    let status = fn(element, &id)
+    return status == 0 && id != 0 ? id : nil
+}
+
+func frameMatchScore(_ a: CGRect, _ b: CGRect) -> CGFloat {
+    abs(a.minX - b.minX) + abs(a.minY - b.minY) + abs(a.width - b.width) + abs(a.height - b.height)
 }
 
 /// Raise in z-order only — do not steal key/main (that demotes sibling windows).
@@ -312,22 +386,31 @@ func setAppFrontmost(pid: pid_t) {
     AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
 }
 
+/// Bring `name` forward without `activateAllWindows` or AppleScript `activate`.
+/// Those both switch to another Space when the app has windows there.
 func activateApp(named name: String, running: NSRunningApplication?) {
     if let running {
-        if running.isHidden {
-            running.unhide()
+        if #available(macOS 14.0, *) {
+            running.activate(from: NSRunningApplication.current)
+        } else {
+            running.activate(options: [.activateIgnoringOtherApps])
         }
-        // activateAllWindows surfaces every window of the app, not only the key one.
-        // Prefer AppKit over a second osascript activate — double-activate caused
-        // extra menu-bar / focus flicker without improving stack order.
-        running.activate(options: [.activateAllWindows])
         setAppFrontmost(pid: running.processIdentifier)
         return
     }
-    // Fallback when we only have a name (no live process handle).
+    setProcessFrontmost(named: name)
+}
+
+func setProcessFrontmost(named name: String) {
+    let escaped = name
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    proc.arguments = ["-e", "tell application \"\(name)\" to activate"]
+    proc.arguments = [
+        "-e",
+        "tell application \"System Events\" to if exists process \"\(escaped)\" then set frontmost of process \"\(escaped)\" to true",
+    ]
     proc.standardOutput = FileHandle.nullDevice
     proc.standardError = FileHandle.nullDevice
     try? proc.run()
@@ -336,11 +419,10 @@ func activateApp(named name: String, running: NSRunningApplication?) {
 
 /// Bring every tiled window above unrelated apps.
 ///
-/// macOS has one key app. Activating an app with `activateAllWindows` lifts that
-/// app’s whole window group above the previous frontmost app. We therefore
-/// activate **once per target app** (not once per window), raise all of that
-/// app’s tiles while it is frontmost, and finish on Ghostty when present so
-/// mixed Ghostty + ChatGPT sets stay above non-target apps without focus thrash.
+/// macOS has one key app. We activate **once per target app** (not once per
+/// window). Raise and focus a tiled window on this Space *before* activation so
+/// macOS does not switch to another virtual desktop. Finish on Ghostty when
+/// present so mixed Ghostty + ChatGPT sets stay above non-target apps.
 func bringTargetsForward(_ windows: [TiledWindow]) {
     guard !windows.isEmpty else { return }
 
@@ -365,16 +447,19 @@ func bringTargetsForward(_ windows: [TiledWindow]) {
     }
 
     // Non-key apps first, Ghostty last (appOrder is Ghostty → ChatGPT by target.order).
-    // Activating ChatGPT first lifts it above whatever was frontmost; activating
-    // Ghostty last leaves Ghostty key while both groups stay above non-targets.
+    // Focus a current-Space tile first so activation does not follow a window
+    // on Desktop 1. Activating Ghostty last leaves it key.
     for app in appOrder.reversed() {
-        let running = NSRunningApplication(processIdentifier: app.pid)
-        activateApp(named: app.name, running: running)
-        // Brief settle so AXRaise applies against the new frontmost app.
-        Thread.sleep(forTimeInterval: 0.03)
-        for el in byPid[app.pid] ?? [] {
+        let els = byPid[app.pid] ?? []
+        for el in els {
             unminimizeAndRaise(el)
         }
+        if let key = els.last {
+            focusWindow(key)
+        }
+        let running = NSRunningApplication(processIdentifier: app.pid)
+        activateApp(named: app.name, running: running)
+        Thread.sleep(forTimeInterval: 0.03)
     }
 
     // Pure z-order pass — no further activates (avoids per-window focus flicker).
@@ -384,8 +469,10 @@ func bringTargetsForward(_ windows: [TiledWindow]) {
 }
 
 /// Detached AppleScript written to a temp file (multi-line `-e` is fragile).
-/// After Raycast/Terminal reclaim focus, activate each target app once and AXRaise.
-func scheduleDeferredRaise(appNames: [String], frame: CGRect) {
+/// After Raycast/Terminal reclaim focus, set each target process frontmost.
+/// Do not `tell application to activate` and do not loop every window: both
+/// raise windows on other Spaces and switch the active virtual desktop.
+func scheduleDeferredRaise(appNames: [String]) {
     guard !appNames.isEmpty else { return }
 
     // Prefer finishing on Ghostty when it contributed (matches pre-ChatGPT behavior).
@@ -396,8 +483,6 @@ func scheduleDeferredRaise(appNames: [String], frame: CGRect) {
         return appNames
     }()
 
-    // One cycle only: activate each app once → frontmost → raise its windows.
-    // (Previously two full cycles; the second was pure focus flicker.)
     var lines: [String] = [
         "delay 0.25",
     ]
@@ -406,29 +491,8 @@ func scheduleDeferredRaise(appNames: [String], frame: CGRect) {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         lines.append(contentsOf: [
-            "try",
-            "  tell application \"\(escaped)\" to activate",
-            "end try",
-            "delay 0.04",
             "tell application \"System Events\"",
-            "  if exists process \"\(escaped)\" then",
-            "    tell process \"\(escaped)\"",
-            "      set visible to true",
-            "      set frontmost to true",
-            "      repeat with w in (every window)",
-            "        try",
-            "          set windowPosition to position of w",
-            "          set windowSize to size of w",
-            "          set centerX to (item 1 of windowPosition) + ((item 1 of windowSize) / 2)",
-            "          set centerY to (item 2 of windowPosition) + ((item 2 of windowSize) / 2)",
-            "          if centerX >= \(Int(frame.minX)) and centerX < \(Int(frame.maxX)) and centerY >= \(Int(frame.minY)) and centerY < \(Int(frame.maxY)) then",
-            "            set value of attribute \"AXMinimized\" of w to false",
-            "            perform action \"AXRaise\" of w",
-            "          end if",
-            "        end try",
-            "      end repeat",
-            "    end tell",
-            "  end if",
+            "  if exists process \"\(escaped)\" then set frontmost of process \"\(escaped)\" to true",
             "end tell",
             "delay 0.04",
         ])
@@ -440,12 +504,17 @@ func scheduleDeferredRaise(appNames: [String], frame: CGRect) {
     do {
         try script.write(to: tmp, atomically: true, encoding: .utf8)
     } catch {
-        // Fall back to a minimal multi-activate if we cannot write the script.
         let reActivate = Process()
         reActivate.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         var args: [String] = ["-e", "delay 0.25"]
         for name in orderedNames {
-            args.append(contentsOf: ["-e", "tell application \"\(name)\" to activate"])
+            let escaped = name
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            args.append(contentsOf: [
+                "-e",
+                "tell application \"System Events\" to if exists process \"\(escaped)\" then set frontmost of process \"\(escaped)\" to true",
+            ])
             args.append(contentsOf: ["-e", "delay 0.05"])
         }
         reActivate.arguments = args
@@ -580,6 +649,59 @@ func standardWindows(pid: pid_t) -> [AXUIElement] {
         result.append(win)
     }
     return result
+}
+
+/// AX windows that are on the current Space of `screen`.
+///
+/// AX lists windows on every Space; their frames still intersect the display.
+/// `CGWindowList` `.optionOnScreenOnly` is the current Space. Match by
+/// `CGWindowID` when HIServices provides it; otherwise pair each on-screen
+/// CG window to at most one AX window by bounds.
+func windowsOnCurrentSpace(
+    pid: pid_t,
+    screen: NSScreen,
+    primary: NSScreen,
+    onScreen: [CGWindowSnap]
+) -> [AXUIElement] {
+    let snaps = onScreen.filter { snap in
+        snap.pid == pid && windowIsOnScreenRect(snap.bounds, screen: screen, primary: primary)
+    }
+    guard !snaps.isEmpty else { return [] }
+
+    let candidates = standardWindows(pid: pid).filter {
+        windowIsOnScreen($0, screen: screen, primary: primary)
+    }
+    guard !candidates.isEmpty else { return [] }
+
+    var claimed = Set<CGWindowID>()
+    var matched: [AXUIElement] = []
+    var unmatchedAX: [AXUIElement] = []
+
+    for el in candidates {
+        if let wid = axWindowID(el) {
+            if snaps.contains(where: { $0.id == wid }), claimed.insert(wid).inserted {
+                matched.append(el)
+            }
+        } else {
+            unmatchedAX.append(el)
+        }
+    }
+
+    let matchLimit: CGFloat = 80
+    for el in unmatchedAX {
+        guard let frame = windowFrame(el) else { continue }
+        var best: (id: CGWindowID, score: CGFloat)?
+        for snap in snaps where !claimed.contains(snap.id) {
+            let score = frameMatchScore(frame, snap.bounds)
+            if score < matchLimit, best == nil || score < best!.score {
+                best = (snap.id, score)
+            }
+        }
+        if let best, claimed.insert(best.id).inserted {
+            matched.append(el)
+        }
+    }
+    return matched
 }
 
 // MARK: - Layout
@@ -1164,7 +1286,7 @@ if apps.isEmpty {
     exit(0)
 }
 
-// Capture the destination before activating either target app. This matters for
+// Capture the destination before any app is brought forward. This matters for
 // Raycast, whose silent command can briefly change the frontmost application.
 let screen = targetScreen()
 guard let primary = NSScreen.screens.first else {
@@ -1172,23 +1294,20 @@ guard let primary = NSScreen.screens.first else {
 }
 let frame = axVisibleFrame(of: screen, primary: primary)
 
-// Activate target apps so windows are on-screen / AX-ready.
-var activated = Set<String>()
-for e in apps {
-    if activated.insert(e.target.activateName).inserted {
-        let app = NSRunningApplication(processIdentifier: e.pid)
-        activateApp(named: e.target.activateName, running: app)
-    }
-}
-Thread.sleep(forTimeInterval: 0.05)
+// Capture the current Space before any activation. Activating an app with
+// windows on Desktop 1 would switch Spaces and then we would tile that Space.
+let onScreen = onScreenCGWindows()
 
 // Ghostty windows first, then ChatGPT — each app in AX order.
+// Only windows on this display's current Space participate.
 var windows: [TiledWindow] = []
 for e in apps {
-    for el in standardWindows(pid: e.pid) {
-        guard windowIsOnScreen(el, screen: screen, primary: primary) else {
-            continue
-        }
+    for el in windowsOnCurrentSpace(
+        pid: e.pid,
+        screen: screen,
+        primary: primary,
+        onScreen: onScreen
+    ) {
         windows.append(TiledWindow(
             element: el,
             pid: e.pid,
@@ -1300,8 +1419,8 @@ if fail > 0 {
 // Order: Ghostty first in list still OK — bringTargetsForward activates ChatGPT then Ghostty.
 bringTargetsForward(tiledWindows)
 
-// Detached re-raise after this process exits. Raycast/Terminal/Shortcuts often
-// reclaim focus when the script ends; cycle Ghostty + ChatGPT and AXRaise.
+// Detached frontmost after this process exits. Raycast/Terminal/Shortcuts often
+// reclaim focus when the script ends; restore Ghostty + ChatGPT without a Space switch.
 var appNames: [String] = []
 var seenNames = Set<String>()
 for w in tiledWindows {
@@ -1309,6 +1428,6 @@ for w in tiledWindows {
         appNames.append(w.activateName)
     }
 }
-scheduleDeferredRaise(appNames: appNames, frame: frame)
+scheduleDeferredRaise(appNames: appNames)
 
 exit(0)
